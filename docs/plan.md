@@ -77,6 +77,20 @@ only service of a minimal appliance OS image.
   artifact store is shared or replicated; uses Orbit's control-plane protocol (Orbit roadmap milestone 6).
 * Placement by capacity (memory reservations, invocation slots), node health and draining.
 
+## Control plane in Orin
+
+The API and the console are planned to move into Orin: ordinary Orin programs built on the libraries `orin-web` and
+`orin-ui`, run by `orbitd` itself as **system apps** on Orbit, deployed with the node and holding grants like any other
+app. The Rust host stays minimal: the executor, the supervisor, the store and the bootstrap of the system apps, nothing
+that is policy or presentation.
+
+What they need from the host is one new capability that exposes the store to them, `orbit-cloud:admin/v1`: apps,
+deployments, runs, logs, traces, KV browsing and queues, plus lifecycle operations (deploy, activate, delete, run). It
+is granted only to system apps, never to user apps, and its design (the shape of the calls, what is a stream, how the
+token or the users of milestone 2 map onto it) comes later, together with the first system app. Until then the Rust
+API and console of milestone 1 stay as they are, and the `/v1` HTTP API is the compatibility surface the Orin version
+has to keep.
+
 ## Deployment shapes
 
 * **Docker**: `docker run -p 8080:8080 -v orbit-data:/var/lib/orbit-cloud -e ORBIT_CLOUD_TOKEN=... ghcr.io/orin-lang/orbit-cloud`.

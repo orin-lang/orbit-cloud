@@ -6,7 +6,8 @@ Orbit host ABI) and run it as a **job**, a long-running **service** or a **queue
 **metrics**, a **KV database** and **queues** built in. One binary, `orbitd`, with an embedded SQLite database; it runs
 as a Docker container or as the only service of a minimal appliance OS image.
 
-Status: milestone 1 in progress. See [docs/plan.md](docs/plan.md) for the plan and the milestones.
+Status: milestone 1 (the single-node core). See [docs/plan.md](docs/plan.md) for the plan and the milestones,
+[docs/architecture.md](docs/architecture.md) for how it works and [docs/api.md](docs/api.md) for the HTTP API.
 
 ## Quick start
 
@@ -30,6 +31,23 @@ occtl queue send orders '{"id": 1}'
 occtl logs --app worker -f
 ```
 
+## Run it
+
+**Docker** (build context is the repository root):
+
+```sh
+docker build -f deploy/docker/Dockerfile -t orbit-cloud .
+docker run -d -p 8080:8080 -v orbit-data:/var/lib/orbit-cloud -e ORBIT_CLOUD_TOKEN=secret orbit-cloud
+# or: ORBIT_CLOUD_TOKEN=secret docker compose -f deploy/docker/compose.yaml up --build
+```
+
+**systemd**: install `orbitd` to `/usr/bin`, copy `deploy/systemd/orbitd.service` to `/etc/systemd/system/`, put
+`ORBIT_CLOUD_TOKEN=...` in `/etc/orbit-cloud/orbitd.env` (mode 0600) and `systemctl enable --now orbitd`. The unit uses
+a dynamic user and a sandbox.
+
+**Appliance image**: `deploy/os/` builds a minimal Debian disk image with mkosi, read-only root and the data on its own
+partition; see [deploy/os/README.md](deploy/os/README.md) for building it and booting it in QEMU.
+
 ## Layout
 
 | Path | What |
@@ -38,7 +56,7 @@ occtl logs --app worker -f
 | `crates/orbitd` | the node: executor on `orbit-runtime`, supervisor for services and consumers, HTTP API, metrics, console |
 | `crates/occtl` | the command-line client |
 | `docs/` | plan, architecture, API |
-| `deploy/` | Docker, systemd and the appliance OS recipe |
+| `deploy/` | Docker (`docker/`), systemd (`systemd/`) and the mkosi appliance OS recipe (`os/`) |
 
 ## License
 
