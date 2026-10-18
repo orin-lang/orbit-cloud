@@ -15,7 +15,7 @@ use orbit_caps::{
     StdinReader, WasiCapability,
 };
 use orbit_runtime::{CapabilityRegistry, ExecError, InstanceInfo, Isolate, Runtime, RuntimeConfig};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::spec::Spec;
 
@@ -48,7 +48,7 @@ impl RunIndex {
 /// guest: the channel is unbounded and the writer drains it in batches.
 struct CloudSink {
     runs: Arc<RunIndex>,
-    tx: mpsc::UnboundedSender<NewLog>,
+    tx: mpsc::UnboundedSender<LogMsg>,
     lines: Arc<AtomicU64>,
 }
 
@@ -57,35 +57,58 @@ impl LogSink for CloudSink {
         let run_id = self.runs.map().get(&r.instance.0).cloned();
         self.lines.fetch_add(1, Ordering::Relaxed);
         // A send fails only after shutdown; the line is dropped then.
-        let _ = self.tx.send(NewLog {
+        let _ = self.tx.send(LogMsg::Line(NewLog {
             ts: oc_store::now_ms(),
             app: r.tenant.to_string(),
             run_id,
             level: r.level.as_str().to_owned(),
             message: r.message.clone(),
-        });
+        }));
     }
 }
 
-/// Writes log lines to the store in batches (up to 500 lines or every 200 ms).
-async fn log_writer(store: Arc<Store>, mut rx: mpsc::UnboundedReceiver<NewLog>) {
+/// What the log channel carries: a line, or a request to acknowledge once everything sent before it is stored.
+enum LogMsg {
+    Line(NewLog),
+    Flush(oneshot::Sender<()>),
+}
+
+/// Writes log lines to the store in batches (up to 500 lines or every 200 ms). A flush request ends the batch at
+/// once and is acknowledged after the write.
+async fn log_writer(store: Arc<Store>, mut rx: mpsc::UnboundedReceiver<LogMsg>) {
     let mut batch = Vec::new();
+    let mut acks = Vec::new();
     loop {
-        let first = rx.recv().await;
-        let Some(first) = first else { break };
-        batch.push(first);
+        let Some(first) = rx.recv().await else { break };
+        let mut open = true;
+        match first {
+            LogMsg::Line(l) => batch.push(l),
+            LogMsg::Flush(a) => {
+                acks.push(a);
+                open = false;
+            }
+        }
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(200);
-        while batch.len() < 500 {
+        while open && batch.len() < 500 {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(l)) => batch.push(l),
+                Ok(Some(LogMsg::Line(l))) => batch.push(l),
+                Ok(Some(LogMsg::Flush(a))) => {
+                    acks.push(a);
+                    open = false;
+                }
                 Ok(None) | Err(_) => break,
             }
         }
         let lines = std::mem::take(&mut batch);
-        let s = Arc::clone(&store);
-        let res = tokio::task::spawn_blocking(move || s.append_logs(&lines)).await;
-        if let Ok(Err(e)) = res {
-            tracing::error!("writing log lines failed: {e}");
+        if !lines.is_empty() {
+            let s = Arc::clone(&store);
+            let res = tokio::task::spawn_blocking(move || s.append_logs(&lines)).await;
+            if let Ok(Err(e)) = res {
+                tracing::error!("writing log lines failed: {e}");
+            }
+        }
+        for a in acks.drain(..) {
+            let _ = a.send(());
         }
     }
 }
@@ -172,6 +195,7 @@ pub struct Executor {
     runs: Arc<RunIndex>,
     stdin: RunStdin,
     files_root: PathBuf,
+    log_tx: mpsc::UnboundedSender<LogMsg>,
     /// Metrics.
     pub counters: Arc<Counters>,
 }
@@ -234,7 +258,7 @@ impl Executor {
         tokio::spawn(log_writer(Arc::clone(&store), rx));
         let sink = Arc::new(CloudSink {
             runs: Arc::clone(&runs),
-            tx,
+            tx: tx.clone(),
             lines: Arc::clone(&counters.log_lines),
         });
         let stdin = RunStdin::default();
@@ -259,6 +283,7 @@ impl Executor {
             runs,
             stdin,
             files_root,
+            log_tx: tx,
             counters,
         })
     }
@@ -315,8 +340,18 @@ impl Executor {
             }),
         });
         self.store.insert_spans(&tl.spans)?;
+        // The run's log lines are in the store before the run reads as finished.
+        self.flush_logs().await;
         self.store.finish_run(&run.id, &outcome)?;
         Ok(self.store.run(&run.id)?)
+    }
+
+    /// Waits until every log line written so far is stored.
+    async fn flush_logs(&self) {
+        let (tx, rx) = oneshot::channel();
+        if self.log_tx.send(LogMsg::Flush(tx)).is_ok() {
+            let _ = rx.await;
+        }
     }
 
     async fn attempt(

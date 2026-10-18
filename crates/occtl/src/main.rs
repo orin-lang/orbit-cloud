@@ -303,8 +303,15 @@ fn encode(v: &str) -> String {
         .collect()
 }
 
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("Error: {e:#}");
+        std::process::exit(1);
+    }
+}
+
 #[allow(clippy::too_many_lines)]
-fn main() -> Result<()> {
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .http_status_as_error(false)
@@ -464,7 +471,6 @@ fn main() -> Result<()> {
                 println!("error: {e}");
             }
             if !detach {
-                std::thread::sleep(Duration::from_millis(300)); // the log writer batches every 200 ms
                 print_logs(&c.json("GET", &format!("/runs/{}/logs", s(&r["id"])), None)?);
                 if r["status"] != "succeeded" {
                     std::process::exit(1);

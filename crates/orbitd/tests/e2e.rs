@@ -390,3 +390,48 @@ async fn service_is_supervised_and_replaced_on_redeploy() {
     let (s, _) = json_call(&f.app, "GET", "/v1/apps/svc", vec![]).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn logs_are_stored_when_the_run_reads_as_finished() {
+    let f = fx().await;
+    deploy(&f.app, "hello", HELLO, json!({})).await;
+    for _ in 0..5 {
+        let (_, run) = json_call(&f.app, "POST", "/v1/apps/hello/runs", vec![]).await;
+        let id = run["id"].as_str().unwrap();
+        // one query, no waiting: the 200 ms batch must not leave the lines behind a finished run
+        let (_, v) = json_call(&f.app, "GET", &format!("/v1/runs/{id}/logs"), vec![]).await;
+        assert_eq!(v.as_array().unwrap().len(), 1, "{v}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wall_clock_limit_fails_a_runaway_job() {
+    let f = fx().await;
+    deploy(&f.app, "spin", SPIN, json!({"limits": {"timeout_ms": 300}})).await;
+    let (s, run) = json_call(&f.app, "POST", "/v1/apps/spin/runs", vec![]).await;
+    assert_eq!(s, StatusCode::OK, "{run}");
+    assert_eq!(run["status"], "failed", "{run}");
+    assert!(run["error"].is_string(), "{run}");
+}
+
+/// A program built by the real Orin toolchain (`tests/fixtures/hello.or`, see the README there).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn orin_real_program_runs() {
+    let f = fx().await;
+    let wasm = include_bytes!("fixtures/hello.wasm").to_vec();
+    let (s, b) = call(
+        &f.app,
+        "POST",
+        "/v1/apps/orin-hello/deployments",
+        Some(&json!({})),
+        wasm,
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{}", String::from_utf8_lossy(&b));
+    let (s, run) = json_call(&f.app, "POST", "/v1/apps/orin-hello/runs", vec![]).await;
+    assert_eq!(s, StatusCode::OK, "{run}");
+    assert_eq!(run["status"], "succeeded", "{run}");
+    assert_eq!(run["exit_code"], 0, "{run}");
+    let id = run["id"].as_str().unwrap();
+    assert_eq!(logs_of(&f.app, id, 1).await, ["hi"]);
+}
