@@ -291,7 +291,10 @@ The Orin console (on `claude/orin-console`) can build on these; bodies are in [a
 * **GitHub OAuth**, **passkeys / WebAuthn** (store credentials in a `webauthn_credentials` table, add as a second factor or a
   primary method, issue the same session), **email invitations**, password reset by email, TOTP.
 * **TLS-ALPN-01** and DNS-01 (wildcards by ACME).
-* ACME has no integration test against a real CA in CI (Pebble is not available there); the plumbing (known-host
-  gate, challenge responses, back-off, certificate selection, storage) is unit tested, see `gateway::tls`.
+* The ACME integration test (`crates/orbitd/tests/acme_pebble.rs`: on-demand order over HTTP-01 against
+  [Pebble](https://github.com/letsencrypt/pebble), TLS-verified client, unknown names refused) is opt-in because CI has
+  no Pebble: set `PEBBLE_BIN` and `PEBBLE_CHALLTESTSRV_BIN` (both installable with `go install`) to run it. Everything
+  around it (known-host gate, challenge responses, back-off, certificate selection, storage) is also unit tested in
+  `gateway::tls`. Not exercised against Let's Encrypt itself; try `--acme-staging` first.
 * Quotas and billing per organisation, per-project secrets, per-project queues API (queue names are prefixed already).
 * Multi-node gateways (certificates live in the node's store).
