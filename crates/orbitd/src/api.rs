@@ -190,6 +190,11 @@ async fn get_app(State(s): State<AppState>, Path(app): Path<String>) -> ApiResul
 async fn delete_app(State(s): State<AppState>, Path(app): Path<String>) -> ApiResult<StatusCode> {
     s.node.executor.store().delete_app(&app)?;
     s.node.reconcile(&app).await?;
+    // after the worker has stopped, so nothing is writing there any more
+    s.node
+        .executor
+        .remove_app_files(&app)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("app files: {e}")))?;
     Ok(StatusCode::NO_CONTENT)
 }
 

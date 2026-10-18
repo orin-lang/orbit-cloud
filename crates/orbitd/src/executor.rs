@@ -346,6 +346,19 @@ impl Executor {
         Ok(self.store.run(&run.id)?)
     }
 
+    /// Removes the app's persistent files directory (`files: true` in its spec), so a new app of the same name starts
+    /// empty.
+    ///
+    /// # Errors
+    /// When the directory exists and cannot be removed.
+    pub fn remove_app_files(&self, app: &str) -> std::io::Result<()> {
+        debug_assert!(oc_store::valid_name(app), "app names are validated");
+        match std::fs::remove_dir_all(self.files_root.join(app)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        }
+    }
+
     /// Waits until every log line written so far is stored.
     async fn flush_logs(&self) {
         let (tx, rx) = oneshot::channel();

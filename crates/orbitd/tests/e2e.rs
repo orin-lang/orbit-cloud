@@ -435,3 +435,22 @@ async fn orin_real_program_runs() {
     let id = run["id"].as_str().unwrap();
     assert_eq!(logs_of(&f.app, id, 1).await, ["hi"]);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deleting_an_app_removes_its_files_and_kv() {
+    let f = fx().await;
+    deploy(&f.app, "gone", HELLO, json!({"files": true})).await;
+    let dir = f._dir.path().join("files/gone");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("secret.txt"), b"old tenant data").unwrap();
+    let (s, _) = call(&f.app, "PUT", "/v1/apps/gone/kv/ns/k", None, b"v".to_vec()).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = call(&f.app, "DELETE", "/v1/apps/gone", None, vec![]).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert!(!dir.exists(), "the files directory outlived the app");
+    // an app of the same name starts empty
+    deploy(&f.app, "gone", HELLO, json!({"files": true})).await;
+    let (_, v) = json_call(&f.app, "GET", "/v1/apps/gone/kv", vec![]).await;
+    assert_eq!(v, json!([]));
+    assert!(!dir.exists());
+}
