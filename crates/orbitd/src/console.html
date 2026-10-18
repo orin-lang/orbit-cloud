@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orbit Cloud</title>
+<style>
+  :root { --bg:#fafafa; --fg:#1d1d1f; --muted:#6b6b70; --line:#e3e3e6; --card:#fff; --accent:#4a5bd4;
+          --ok:#1f8a4c; --bad:#c23b3b; --warn:#b07400; --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#141416; --fg:#ececf0; --muted:#9a9aa3; --line:#2a2a2f; --card:#1c1c20; --accent:#8b97ff;
+            --ok:#4cc07f; --bad:#ff7070; --warn:#e7b04a; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; font: 14px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+  header { display:flex; align-items:center; gap:16px; padding:12px 20px; border-bottom:1px solid var(--line); }
+  header h1 { font-size:16px; margin:0; }
+  nav a { margin-right:14px; color: var(--muted); text-decoration:none; cursor:pointer; }
+  nav a.on { color: var(--fg); font-weight:600; }
+  main { padding:20px; max-width:1200px; margin:0 auto; }
+  table { width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--line); }
+  th, td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { font-weight:600; color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  tr.click { cursor:pointer; } tr.click:hover { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+  .mono { font-family: var(--mono); font-size:12.5px; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); } .muted { color: var(--muted); }
+  .card { background:var(--card); border:1px solid var(--line); padding:14px; margin-bottom:16px; }
+  h2 { font-size:15px; margin:18px 0 8px; }
+  pre.logs { background:var(--card); border:1px solid var(--line); padding:10px; max-height:60vh; overflow:auto; margin:0;
+             font-family:var(--mono); font-size:12.5px; white-space:pre-wrap; word-break:break-word; }
+  .bar { position:relative; height:16px; background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .bar span { position:absolute; top:0; bottom:0; background: var(--accent); min-width:2px; }
+  input, select, button { font:inherit; padding:5px 8px; border:1px solid var(--line); background:var(--card); color:var(--fg); }
+  button { cursor:pointer; } .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+  #tokenbox { margin-left:auto; display:flex; gap:6px; }
+  @media (max-width: 700px) { header { flex-wrap:wrap; } #tokenbox { margin-left:0; width:100%; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Orbit Cloud</h1>
+  <nav id="nav">
+    <a data-v="apps">Apps</a><a data-v="runs">Runs</a><a data-v="logs">Logs</a><a data-v="queues">Queues</a>
+  </nav>
+  <div id="tokenbox"><input id="token" type="password" placeholder="API token" size="18"><button id="save">Save</button></div>
+</header>
+<main id="main"></main>
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const when = ms => ms ? new Date(ms).toLocaleString() : "";
+let token = ""; try { token = localStorage.getItem("orbit-cloud-token") || ""; } catch (e) {}
+$("#token").value = token;
+$("#save").onclick = () => { token = $("#token").value; try { localStorage.setItem("orbit-cloud-token", token); } catch (e) {} route(); };
+let stream = null;
+
+async function api(path, opts = {}) {
+  const r = await fetch("/v1" + path, { ...opts, headers: { ...(opts.headers || {}), Authorization: "Bearer " + token } });
+  if (r.status === 401) throw new Error("Unauthorized: enter the API token (ORBIT_CLOUD_TOKEN) above.");
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+  return r.status === 204 ? null : (r.headers.get("content-type") || "").includes("json") ? r.json() : r.text();
+}
+const status = s => `<span class="${s === "succeeded" ? "ok" : s === "failed" ? "bad" : "warn"}">${esc(s)}</span>`;
+function runsTable(runs) {
+  return `<table><tr><th>Run</th><th>App</th><th>Trigger</th><th>Status</th><th>Exit</th><th>Wall</th><th>Started</th></tr>` +
+    runs.map(r => `<tr class="click" data-run="${esc(r.id)}"><td class="mono">${esc(r.id)}</td><td>${esc(r.app)}</td><td>${esc(r.trigger)}</td>
+      <td>${status(r.status)}</td><td>${r.exit_code ?? ""}</td><td>${r.wall_ms != null ? r.wall_ms + " ms" : ""}</td><td class="muted">${when(r.started_at)}</td></tr>`).join("") + `</table>`;
+}
+function bindRuns() { document.querySelectorAll("[data-run]").forEach(tr => tr.onclick = () => go("run/" + tr.dataset.run)); }
+
+const views = {
+  async apps() {
+    const apps = await api("/apps");
+    return `<h2>Apps</h2>` + (apps.length ? `<table><tr><th>Name</th><th>Kind</th><th>Version</th><th>Worker</th><th>Created</th></tr>` +
+      apps.map(a => `<tr class="click" data-app="${esc(a.name)}"><td>${esc(a.name)}</td><td>${esc(a.kind)}</td><td>${a.version ?? "–"}</td>
+        <td>${a.kind === "job" ? "" : a.worker_running ? '<span class="ok">running</span>' : '<span class="bad">stopped</span>'}</td>
+        <td class="muted">${when(a.created_at)}</td></tr>`).join("") + `</table>`
+      : `<p class="muted">No apps yet. Deploy one with <span class="mono">occtl deploy NAME app.wasm</span>.</p>`);
+  },
+  async app(name) {
+    const a = await api("/apps/" + encodeURIComponent(name));
+    const runs = await api("/apps/" + encodeURIComponent(name) + "/runs?limit=20");
+    const kv = await api("/apps/" + encodeURIComponent(name) + "/kv");
+    const kind = a.deployments[0]?.spec?.kind || "job";
+    return `<h2>${esc(name)}</h2><div class="row">${kind !== "service" ? `<button id="runbtn">Run now</button>` : ""}
+      <button id="delbtn">Delete app</button></div>
+      <h2>Deployments</h2><table><tr><th>Version</th><th>Module</th><th>Spec</th><th>Created</th><th></th></tr>` +
+      a.deployments.map(d => `<tr><td>${d.version}${d.id === a.app.active_deployment ? ' <span class="ok">active</span>' : ""}</td>
+        <td class="mono">${esc(d.module.slice(0, 12))}</td><td class="mono">${esc(JSON.stringify(d.spec))}</td><td class="muted">${when(d.created_at)}</td>
+        <td>${d.id !== a.app.active_deployment ? `<button data-act="${d.id}">Activate</button>` : ""}</td></tr>`).join("") + `</table>
+      <h2>Runs</h2>${runsTable(runs)}
+      <h2>KV</h2>${kv.length ? kv.map(n => `<a class="mono" style="cursor:pointer" data-ns="${esc(n.namespace)}">${esc(n.namespace)}</a> (${n.entries})`).join(" · ") : '<p class="muted">No data.</p>'}
+      <div id="kvview"></div>`;
+  },
+  async runs() { return `<h2>Recent runs</h2>` + runsTable(await api("/runs?limit=100")); },
+  async run(id) {
+    const r = await api("/runs/" + id), t = await api("/runs/" + id + "/trace"), logs = await api("/runs/" + id + "/logs?limit=2000");
+    const t0 = Math.min(...t.spans.map(s => s.start_us)), t1 = Math.max(...t.spans.map(s => s.end_us)), w = Math.max(1, t1 - t0);
+    return `<h2>Run <span class="mono">${esc(id)}</span> of <a style="cursor:pointer" data-app="${esc(r.app)}">${esc(r.app)}</a></h2>
+      <div class="card">${status(r.status)} · exit ${r.exit_code ?? "–"} · ${r.wall_ms ?? "–"} ms · trigger ${esc(r.trigger)}
+        · peak memory ${r.peak_memory != null ? (r.peak_memory / 1024).toFixed(0) + " KiB" : "–"} · fuel ${r.fuel ?? "–"}
+        ${r.error ? `<div class="bad mono">${esc(r.error)}</div>` : ""}<div class="muted mono">trace ${esc(r.trace_id)}</div></div>
+      <h2>Trace</h2><table><tr><th style="width:18%">Span</th><th style="width:12%">Duration</th><th>Timeline</th></tr>` +
+      t.spans.map(s => `<tr><td>${s.parent_id ? "&nbsp;&nbsp;" : ""}${esc(s.name)}</td><td>${((s.end_us - s.start_us) / 1000).toFixed(2)} ms</td>
+        <td><div class="bar" title="${esc(JSON.stringify(s.attrs))}"><span style="left:${(s.start_us - t0) / w * 100}%;width:${(s.end_us - s.start_us) / w * 100}%"></span></div></td></tr>`).join("") +
+      `</table><h2>Logs</h2><pre class="logs">${logs.map(l => `${new Date(l.ts).toISOString().slice(11, 23)} ${l.level.padEnd(5)} ${esc(l.message)}`).join("\n") || "(none)"}</pre>`;
+  },
+  async logs() {
+    return `<h2>Live logs</h2><div class="row"><input id="fapp" placeholder="app"><select id="flevel"><option value="">any level</option>
+      <option>trace</option><option>debug</option><option>info</option><option>warn</option><option>error</option></select>
+      <input id="ftext" placeholder="contains"><button id="fgo">Follow</button></div><pre class="logs" id="live"></pre>`;
+  },
+  async queues() {
+    const qs = await api("/queues");
+    return `<h2>Queues</h2>` + (qs.length ? `<table><tr><th>Queue</th><th>Ready</th><th>Leased</th><th>Dead</th><th>Done</th><th></th></tr>` +
+      qs.map(q => `<tr><td>${esc(q.queue)}</td><td>${q.ready}</td><td>${q.leased}</td><td class="${q.dead ? "bad" : ""}">${q.dead}</td><td>${q.done}</td>
+        <td>${q.dead ? `<button data-redrive="${esc(q.queue)}">Redrive</button>` : ""}</td></tr>`).join("") + `</table>` : `<p class="muted">No queues yet.</p>`) +
+      `<h2>Publish</h2><div class="row"><input id="qname" placeholder="queue"><input id="qbody" placeholder="message" size="40"><button id="qsend">Send</button></div>`;
+  },
+};
+
+function go(h) { location.hash = h; }
+async function route() {
+  if (stream) { stream.close(); stream = null; }
+  const [v, arg] = (location.hash.slice(1) || "apps").split("/");
+  document.querySelectorAll("#nav a").forEach(a => a.classList.toggle("on", a.dataset.v === v || (v === "app" && a.dataset.v === "apps") || (v === "run" && a.dataset.v === "runs")));
+  const main = $("#main");
+  try { main.innerHTML = await views[v](arg && decodeURIComponent(arg)); } catch (e) { main.innerHTML = `<p class="bad">${esc(e.message)}</p>`; return; }
+  document.querySelectorAll("[data-app]").forEach(e => e.onclick = () => go("app/" + encodeURIComponent(e.dataset.app)));
+  bindRuns();
+  document.querySelectorAll("[data-act]").forEach(b => b.onclick = async () => { await api(`/apps/${arg}/deployments/${b.dataset.act}/activate`, { method: "POST" }); route(); });
+  document.querySelectorAll("[data-redrive]").forEach(b => b.onclick = async () => { await api(`/queues/${b.dataset.redrive}/redrive`, { method: "POST" }); route(); });
+  document.querySelectorAll("[data-ns]").forEach(a => a.onclick = async () => {
+    const rows = await api(`/apps/${arg}/kv/${encodeURIComponent(a.dataset.ns)}?limit=200`);
+    $("#kvview").innerHTML = `<table><tr><th>Key</th><th>Value</th><th>Size</th></tr>` + rows.map(r => `<tr><td class="mono">${esc(r.key)}</td><td class="mono">${esc(r.value.slice(0, 200))}</td><td>${r.size}</td></tr>`).join("") + `</table>`;
+  });
+  if ($("#runbtn")) $("#runbtn").onclick = async () => { const r = await api(`/apps/${arg}/runs`, { method: "POST" }); go("run/" + r.id); };
+  if ($("#delbtn")) $("#delbtn").onclick = async () => { if (confirm(`Delete ${arg} with all its runs, logs and data?`)) { await api(`/apps/${arg}`, { method: "DELETE" }); go("apps"); } };
+  if ($("#qsend")) $("#qsend").onclick = async () => { await api(`/queues/${encodeURIComponent($("#qname").value)}/messages`, { method: "POST", body: $("#qbody").value }); route(); };
+  if ($("#fgo")) $("#fgo").onclick = () => {
+    if (stream) stream.close();
+    const p = new URLSearchParams({ token });
+    if ($("#fapp").value) p.set("app", $("#fapp").value);
+    if ($("#flevel").value) p.set("level", $("#flevel").value);
+    if ($("#ftext").value) p.set("contains", $("#ftext").value);
+    const out = $("#live"); out.textContent = "";
+    stream = new EventSource("/v1/logs/stream?" + p);
+    stream.onmessage = e => { const l = JSON.parse(e.data);
+      out.textContent += `${new Date(l.ts).toISOString().slice(11, 23)} ${l.app} ${l.level.padEnd(5)} ${l.message}\n`; out.scrollTop = out.scrollHeight; };
+  };
+}
+document.querySelectorAll("#nav a").forEach(a => a.onclick = () => go(a.dataset.v));
+window.onhashchange = route;
+route();
+</script>
+</body>
+</html>

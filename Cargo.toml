@@ -1,0 +1,39 @@
+[workspace]
+resolver = "3"
+members = ["crates/oc-store", "crates/orbitd", "crates/occtl"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+oc-store = { path = "crates/oc-store" }
+# Orbit, pinned to a commit of orin-lang/orbit main (bump deliberately: the host ABI is versioned per capability).
+orbit-abi = { git = "https://github.com/orin-lang/orbit", rev = "94fd1a093a521f85a07a3b471d78df9f87d984bc" }
+orbit-runtime = { git = "https://github.com/orin-lang/orbit", rev = "94fd1a093a521f85a07a3b471d78df9f87d984bc" }
+orbit-caps = { git = "https://github.com/orin-lang/orbit", rev = "94fd1a093a521f85a07a3b471d78df9f87d984bc" }
+rusqlite = { version = "0.37", features = ["bundled"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+sha2 = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rand = "0.9"
+futures-util = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+wat = "1"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
