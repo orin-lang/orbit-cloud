@@ -496,6 +496,10 @@ impl Executor {
             .last_invocation
             .as_ref()
             .map(|i| i64::try_from(i.wall_time.as_millis()).unwrap_or(i64::MAX));
+        o.wall_us = m
+            .last_invocation
+            .as_ref()
+            .map(|i| i64::try_from(i.wall_time.as_micros()).unwrap_or(i64::MAX));
         o.fuel = m.fuel_consumed.and_then(|f| i64::try_from(f).ok());
         o.peak_memory = i64::try_from(m.peak_memory_bytes).ok();
         o.host_calls = Some(serde_json::Value::Object(calls));

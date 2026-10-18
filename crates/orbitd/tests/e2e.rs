@@ -454,3 +454,39 @@ async fn deleting_an_app_removes_its_files_and_kv() {
     assert_eq!(v, json!([]));
     assert!(!dir.exists());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stats_report_runs_percentiles_and_microsecond_durations() {
+    let f = fx().await;
+    deploy(&f.app, "stat", HELLO, json!({})).await;
+    for _ in 0..3 {
+        let (s, run) = json_call(&f.app, "POST", "/v1/apps/stat/runs", vec![]).await;
+        assert_eq!(s, StatusCode::OK, "{run}");
+        assert!(
+            run["wall_us"].as_i64().unwrap() >= 0,
+            "runs carry microseconds: {run}"
+        );
+    }
+    let (s, st) = json_call(&f.app, "GET", "/v1/stats?bucket=3600000", vec![]).await;
+    assert_eq!(s, StatusCode::OK, "{st}");
+    assert_eq!(st["bucket_ms"], 3_600_000);
+    assert_eq!(
+        st["buckets"].as_array().unwrap().len(),
+        24,
+        "a day of hourly buckets"
+    );
+    assert_eq!(st["totals"]["succeeded"], 3, "{st}");
+    assert_eq!(st["totals"]["failed"], 0);
+    assert!(st["totals"]["p95_us"].is_i64(), "{st}");
+    let (_, other) = json_call(&f.app, "GET", "/v1/stats?app=nobody", vec![]).await;
+    assert_eq!(other["totals"]["succeeded"], 0);
+    assert!(other["totals"]["p50_us"].is_null());
+    for bad in [
+        "bucket=10",
+        "since=5&until=5",
+        "since=0&until=999999999999&bucket=1000",
+    ] {
+        let (s, e) = json_call(&f.app, "GET", &format!("/v1/stats?{bad}"), vec![]).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {e}");
+    }
+}

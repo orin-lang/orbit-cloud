@@ -156,6 +156,25 @@ curl -N -H "$H" "$B/v1/logs/stream?app=hello"
 ```
 CLI: `occtl logs -f`.
 
+### `GET /v1/stats`
+Run statistics per time bucket, aggregated in SQL; the data behind the console's charts.
+
+| Query | Meaning |
+|---|---|
+| `until` | end of the range, Unix ms, exclusive (default now) |
+| `since` | start of the range (default `until` minus 24 h) |
+| `bucket` | bucket width in ms, at least 1000 (default 3 600 000); at most 1000 buckets in the range |
+| `app` | only this app |
+
+```json
+{"since":1792300000000,"until":1792386400000,"bucket_ms":3600000,
+ "buckets":[{"t":1792300000000,"succeeded":4,"failed":1,"running":0,"p50_us":850,"p95_us":2210,"logs":5}, ...],
+ "totals":{"t":1792300000000,"succeeded":90,"failed":7,"running":0,"p50_us":900,"p95_us":4100,"logs":97}}
+```
+Every bucket in the range is present (empty ones with zeros), oldest first. A run is counted in the bucket where it started.
+`p50_us`/`p95_us` are nearest-rank percentiles of the run time in microseconds, `null` without finished runs. 400 for a bad
+range. Runs also have `wall_us` (microseconds; `null` for runs recorded by an older orbitd, whose `wall_ms` is used instead).
+
 ## KV
 
 The data behind `orbit:kv/v1`; the tenant is the app. Keys and values are bytes; listings show them as UTF-8 (lossy).
