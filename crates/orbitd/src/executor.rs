@@ -17,8 +17,9 @@ use orbit_caps::{
 use orbit_runtime::{CapabilityRegistry, ExecError, InstanceInfo, Isolate, Runtime, RuntimeConfig};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::provision::Postgres;
 use crate::queues::{GuestQueues, MessageQueue};
-use crate::spec::Spec;
+use crate::spec::{Injected, Spec};
 
 /// Key in the `process/v1` grant config that names the stdin bytes of a run (ignored by Orbit, read by [`RunStdin`]).
 pub const STDIN_KEY: &str = "orbit_cloud_stdin";
@@ -197,6 +198,7 @@ pub struct Executor {
     stdin: RunStdin,
     files_root: PathBuf,
     queues: Arc<dyn MessageQueue>,
+    postgres: Option<Arc<Postgres>>,
     queue_signal: Arc<tokio::sync::Notify>,
     log_tx: mpsc::UnboundedSender<LogMsg>,
     /// Metrics.
@@ -306,10 +308,44 @@ impl Executor {
             stdin,
             files_root,
             queues,
+            postgres: None,
             queue_signal,
             log_tx: tx,
             counters,
         })
+    }
+
+    /// Enables PostgreSQL provisioning (`--postgres-url`).
+    #[must_use]
+    pub fn with_postgres(mut self, postgres: Arc<Postgres>) -> Self {
+        self.postgres = Some(postgres);
+        self
+    }
+
+    /// The operator's PostgreSQL server, when configured.
+    #[must_use]
+    pub fn postgres(&self) -> Option<&Arc<Postgres>> {
+        self.postgres.as_ref()
+    }
+
+    /// What to add to a run of `app`: its `DATABASE_URL` and the grant to reach the server.
+    fn injection(&self, app: &str, spec: &Spec) -> Result<Injected, String> {
+        let mut inj = Injected::default();
+        if !spec.postgres {
+            return Ok(inj);
+        }
+        let Some(pg) = &self.postgres else {
+            return Err("the spec asks for postgres but this node has no --postgres-url".into());
+        };
+        let d = self
+            .store
+            .app_database(app)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("the database of `{app}` is not provisioned"))?;
+        inj.env
+            .insert("DATABASE_URL".to_owned(), pg.database_url(&d, true));
+        inj.connect.push(pg.connect_pattern());
+        Ok(inj)
     }
 
     /// The queue backend (consumers, the queue API and `orbit:queue/v1` all go through it).
@@ -460,7 +496,16 @@ impl Executor {
                 .insert(key.clone(), bytes);
             key
         });
-        let grants = match spec.grants(&d.app, stdin_key.as_deref(), files_dir.as_deref()) {
+        let injected = match self.injection(&d.app, &spec) {
+            Ok(i) => i,
+            Err(e) => return failed(e),
+        };
+        let grants = match spec.grants_with(
+            &d.app,
+            stdin_key.as_deref(),
+            files_dir.as_deref(),
+            &injected,
+        ) {
             Ok(g) => g,
             Err(e) => return failed(e),
         };

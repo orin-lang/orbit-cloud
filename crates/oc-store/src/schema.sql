@@ -93,3 +93,14 @@ CREATE TABLE IF NOT EXISTS queue_messages (
     last_error  TEXT
 );
 CREATE INDEX IF NOT EXISTS queue_ready ON queue_messages (queue, state, visible_at, id);
+
+-- The PostgreSQL database and login role provisioned for an app (orbitd --postgres-url). It outlives the app unless the
+-- app is deleted with ?purge=true, so a redeployed app finds its data again. The password is stored in clear text for
+-- now (encryption at rest is a follow-up, see docs/postgres.md).
+CREATE TABLE IF NOT EXISTS app_databases (
+    app        TEXT PRIMARY KEY,
+    db_name    TEXT NOT NULL,
+    role       TEXT NOT NULL,
+    password   TEXT NOT NULL,
+    created_at INTEGER NOT NULL
+);

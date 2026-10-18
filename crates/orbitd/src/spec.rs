@@ -75,6 +75,9 @@ pub struct Spec {
     pub kv_namespaces: Vec<String>,
     /// Queues the app may publish to with `orbit:queue/v1` (deny by default); a consumer's own `queue` is separate.
     pub publish: Vec<String>,
+    /// A PostgreSQL database and role of its own (needs orbitd's `--postgres-url`): on deploy they are created if missing,
+    /// `DATABASE_URL` is added to the environment and the server's `HOST:PORT` to the connect grant.
+    pub postgres: bool,
     /// `ADDR:PORT` or `ADDR:LO-HI` the app may listen on (`orbit:net/v1`).
     pub listen: Vec<String>,
     /// `HOST:PORT` patterns the app may connect to and resolve (`orbit:net/v1`).
@@ -93,6 +96,15 @@ pub struct Spec {
     pub queue: Option<String>,
     /// Deliveries of a message before it is dead-lettered (consumer; default 5).
     pub max_attempts: Option<i64>,
+}
+
+/// What the node adds to a run on top of the spec: values that must not be stored in the (visible) spec.
+#[derive(Clone, Debug, Default)]
+pub struct Injected {
+    /// Environment variables; they win over the spec's `env`.
+    pub env: BTreeMap<String, String>,
+    /// Extra `HOST:PORT` connect patterns.
+    pub connect: Vec<String>,
 }
 
 impl Spec {
@@ -163,6 +175,28 @@ impl Spec {
         stdin_key: Option<&str>,
         files_dir: Option<&Path>,
     ) -> Result<Grants, String> {
+        self.grants_with(app, stdin_key, files_dir, &Injected::default())
+    }
+
+    /// Like [`grants`](Self::grants) with what the node injects (the app's `DATABASE_URL` and the grant to reach it).
+    ///
+    /// # Errors
+    /// When the files directory cannot be described as a grant.
+    pub fn grants_with(
+        &self,
+        app: &str,
+        stdin_key: Option<&str>,
+        files_dir: Option<&Path>,
+        injected: &Injected,
+    ) -> Result<Grants, String> {
+        let mut env = self.env.clone();
+        env.extend(injected.env.clone());
+        let connect: Vec<String> = self
+            .connect
+            .iter()
+            .chain(&injected.connect)
+            .cloned()
+            .collect();
         let mut g = Grants::none().grant(CapabilityId::log_v1());
         if self.clock != Some(false) {
             g = g.grant(CapabilityId::clock_v1());
@@ -182,10 +216,10 @@ impl Spec {
                 serde_json::json!({ "publish": self.publish }),
             );
         }
-        if !self.listen.is_empty() || !self.connect.is_empty() {
+        if !self.listen.is_empty() || !connect.is_empty() {
             g = g.grant_with(
                 CapabilityId::net_v1(),
-                net_grant_config(&self.listen, &self.connect),
+                net_grant_config(&self.listen, &connect),
             );
         }
         if let (true, Some(dir)) = (self.files, files_dir) {
@@ -200,7 +234,7 @@ impl Spec {
         let mut p = ProcessGrant::new()
             .args(argv.clone())
             .stdin(stdin_key.is_some());
-        for (k, v) in &self.env {
+        for (k, v) in &env {
             p = p.env(k.as_str(), v.as_str());
         }
         let mut pc = p.to_config();
@@ -210,7 +244,7 @@ impl Spec {
         g = g.grant_with(CapabilityId::process_v1(), pc);
         g = g.grant_with(
             CapabilityId::wasi_p1_v1(),
-            serde_json::json!({ "args": argv, "env": self.env }),
+            serde_json::json!({ "args": argv, "env": env }),
         );
         Ok(g)
     }
@@ -242,6 +276,35 @@ mod tests {
         let bad: Spec =
             serde_json::from_value(serde_json::json!({"listen": ["nonsense"]})).unwrap();
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn injected_values_reach_env_and_connect_grant_but_not_the_spec() {
+        let s: Spec = serde_json::from_value(
+            serde_json::json!({"postgres": true, "env": {"A": "1", "DATABASE_URL": "user-set"}, "connect": ["x:1"]}),
+        )
+        .unwrap();
+        s.validate().unwrap();
+        let inj = Injected {
+            env: BTreeMap::from([(
+                "DATABASE_URL".to_owned(),
+                "postgres://r:p@pg:5432/d".to_owned(),
+            )]),
+            connect: vec!["pg:5432".to_owned()],
+        };
+        let g = s.grants_with("app", None, None, &inj).unwrap();
+        let w = g.config(&CapabilityId::wasi_p1_v1()).unwrap();
+        assert_eq!(
+            w["env"]["DATABASE_URL"], "postgres://r:p@pg:5432/d",
+            "the platform wins over the spec's env"
+        );
+        assert_eq!(w["env"]["A"], "1");
+        let net = g.config(&CapabilityId::net_v1()).unwrap().to_string();
+        assert!(net.contains("pg:5432") && net.contains("x:1"), "{net}");
+        assert_eq!(
+            s.env["DATABASE_URL"], "user-set",
+            "the spec itself is untouched"
+        );
     }
 
     #[test]

@@ -28,6 +28,7 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.9"
+tokio-postgres = "0.7"
 futures-util = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 wat = "1"

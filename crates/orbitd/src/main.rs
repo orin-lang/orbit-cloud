@@ -9,6 +9,7 @@ use clap::Parser;
 use orbitd::api::{AppState, router};
 use orbitd::executor::Executor;
 use orbitd::node::Node;
+use orbitd::provision::Postgres;
 
 /// Runs WebAssembly apps on Orbit with logs, traces, metrics, KV and queues.
 #[derive(Parser, Debug)]
@@ -26,6 +27,11 @@ struct Args {
     /// Meter fuel so runs report it and `limits.fuel` works (costs some speed).
     #[arg(long, env = "ORBIT_CLOUD_FUEL_METERING")]
     fuel_metering: bool,
+    /// PostgreSQL admin connection (superuser, or CREATEROLE + CREATEDB on PostgreSQL 16+), e.g.
+    /// `postgres://postgres:secret@localhost:5432/postgres`. Enables `"postgres": true` in app specs: a database and
+    /// login role per app, `DATABASE_URL` in its environment. The URL holds a secret: prefer the environment variable.
+    #[arg(long, env = "ORBIT_CLOUD_POSTGRES_URL", hide_env_values = true)]
+    postgres_url: Option<String>,
     /// Probe `/healthz` on the listen address and exit 0 if the node answers (for container health checks).
     #[arg(long)]
     healthcheck: bool,
@@ -75,11 +81,16 @@ async fn main() -> anyhow::Result<()> {
     if recovered > 0 {
         tracing::warn!("{recovered} run(s) were active when orbitd last stopped; marked failed");
     }
-    let executor = Arc::new(Executor::new(
-        Arc::clone(&store),
-        &args.data_dir,
-        args.fuel_metering,
-    )?);
+    let mut executor = Executor::new(Arc::clone(&store), &args.data_dir, args.fuel_metering)?;
+    if let Some(url) = args.postgres_url.as_deref().filter(|u| !u.is_empty()) {
+        let pg = Postgres::from_url(url)?;
+        tracing::info!(
+            "PostgreSQL provisioning enabled for {}",
+            pg.connect_pattern()
+        );
+        executor = executor.with_postgres(Arc::new(pg));
+    }
+    let executor = Arc::new(executor);
     let node = Node::new(executor);
     node.start_all().await?;
     let token = args.token.filter(|t| !t.is_empty()).map(Arc::from);

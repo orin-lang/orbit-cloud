@@ -118,6 +118,7 @@ Everything else needs a field in the spec:
 |---|---|---|
 | `orbit:kv/v1` | `kv_namespaces` | only the named namespaces |
 | `orbit:queue/v1` | `publish` | publish only to the named queues (receiving is the consumer app kind); queue names are node-wide |
+| PostgreSQL | `postgres` | a database and login role of the app's own on the operator's server (`--postgres-url`); `DATABASE_URL` is injected and the server's `HOST:PORT` added to the connect grant ([postgres.md](postgres.md)) |
 | `orbit:net/v1` | `listen`, `connect` | only `ADDR:PORT`/`ADDR:LO-HI` to listen on and `HOST:PORT` patterns to connect to or resolve |
 | `orbit:fs/v1` | `files: true` | one read-write directory, `files/<app>/` of the data dir, mounted at `/data`; nothing else of the host |
 | `orbit:process/v1`, `wasi` | always | `argv[0]` is the app name, then `args`; `env` is exactly the spec's `env`; stdin is the run's input. No host environment, no spawning. |

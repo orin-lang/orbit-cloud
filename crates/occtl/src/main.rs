@@ -48,6 +48,9 @@ enum Cmd {
         /// KV namespace the app may use (repeatable).
         #[arg(long = "kv")]
         kv: Vec<String>,
+        /// Give the app a PostgreSQL database and role (needs orbitd --postgres-url).
+        #[arg(long)]
+        postgres: bool,
         /// Queue the app may publish to (repeatable).
         #[arg(long = "publish")]
         publish: Vec<String>,
@@ -77,8 +80,20 @@ enum Cmd {
     Apps,
     /// Shows an app with its deployments.
     App { app: String },
-    /// Deletes an app with its runs, logs and KV data.
-    Delete { app: String },
+    /// Deletes an app with its runs, logs and KV data. Its PostgreSQL database stays unless --purge.
+    Delete {
+        app: String,
+        /// Also drop the app's PostgreSQL database and role (irreversible).
+        #[arg(long)]
+        purge: bool,
+    },
+    /// Shows the app's PostgreSQL database (connection info; the password only with --password).
+    Db {
+        app: String,
+        /// Include the password in the output.
+        #[arg(long)]
+        password: bool,
+    },
     /// Makes VERSION of APP active again.
     Rollback { app: String, version: i64 },
     /// Runs a job (or a consumer, by hand) once and prints the run.
@@ -334,6 +349,7 @@ fn run() -> Result<()> {
             queue,
             kv,
             publish,
+            postgres,
             listen,
             connect,
             env,
@@ -360,6 +376,9 @@ fn run() -> Result<()> {
             }
             if !kv.is_empty() {
                 o.insert("kv_namespaces".into(), json!(kv));
+            }
+            if postgres {
+                o.insert("postgres".into(), json!(true));
             }
             if !publish.is_empty() {
                 o.insert("publish".into(), json!(publish));
@@ -430,9 +449,24 @@ fn run() -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&c.json("GET", &format!("/apps/{app}"), None)?)?
         ),
-        Cmd::Delete { app } => {
-            c.json("DELETE", &format!("/apps/{app}"), None)?;
-            println!("deleted {app}");
+        Cmd::Delete { app, purge } => {
+            let q = if purge { "?purge=true" } else { "" };
+            c.json("DELETE", &format!("/apps/{app}{q}"), None)?;
+            println!(
+                "deleted {app}{}",
+                if purge { " and its database" } else { "" }
+            );
+        }
+        Cmd::Db { app, password } => {
+            let q = if password { "?password=true" } else { "" };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&c.json(
+                    "GET",
+                    &format!("/apps/{app}/database{q}"),
+                    None
+                )?)?
+            );
         }
         Cmd::Rollback { app, version } => {
             let a = c.json("GET", &format!("/apps/{app}"), None)?;

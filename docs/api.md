@@ -26,6 +26,7 @@ rejected. Capabilities are off unless named (see [architecture.md](architecture.
 | `env` | map string to string | `{}` | environment of the run; names non-empty, no `=` |
 | `kv_namespaces` | string[] | `[]` | namespaces of `orbit:kv/v1` the app may use |
 | `publish` | string[] | `[]` | queues the app may publish to with `orbit:queue/v1` (`publish`, `publish_batch`); deny by default |
+| `postgres` | bool | `false` | a PostgreSQL database and role of its own (needs `--postgres-url`): `DATABASE_URL` in the env, connect grant to the server; see [postgres.md](postgres.md) |
 | `listen` | string[] | `[]` | `ADDR:PORT` or `ADDR:LO-HI` the app may listen on |
 | `connect` | string[] | `[]` | `HOST:PORT` patterns the app may connect to and resolve |
 | `files` | bool | `false` | a persistent read-write directory mounted at `/data` |
@@ -92,7 +93,15 @@ Returns the app. 404 if the deployment is not the app's. CLI: `occtl rollback he
 
 ### `DELETE /v1/apps/{app}`
 Stops its worker and deletes the app with its deployments, runs, spans, logs, KV data and files directory. 204. CLI:
-`occtl delete hello`.
+`occtl delete hello`. The app's PostgreSQL database is **kept** (a redeployed app finds its data again); `?purge=true`
+also drops the database and role, irreversibly (CLI `occtl delete hello --purge`), and works on a name whose app is
+already gone but whose database is left.
+
+### `GET /v1/apps/{app}/database`
+The app's PostgreSQL database (see [postgres.md](postgres.md)): `{ enabled, provisioned, database, role, host, port, url,
+size_bytes, connections, reachable, created_at }`. `enabled` says whether the active deployment's spec has `"postgres": true`.
+`url` has no password; `?password=true` adds `password` and puts it in `url`. 400 without `--postgres-url`, 404 for an app
+with neither a deployment nor a database. CLI: `occtl db hello [--password]`.
 
 ## Runs, logs and traces
 

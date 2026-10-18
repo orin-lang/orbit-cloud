@@ -63,6 +63,37 @@ Quit QEMU with `Ctrl-a x`. To get a recovery shell, put `RootPassword=...` in `d
 and rebuild. On a cloud provider or bare metal, pass the credential the way the platform supports systemd credentials
 (a `.cred` file on the ESP, SMBIOS OEM strings, or `systemd.set_credential=` on the kernel command line for tests).
 
+## A local PostgreSQL in the image (optional)
+
+Apps with `"postgres": true` need a PostgreSQL server that orbitd can administer. The appliance can carry one:
+
+1. Add the server to the image and keep its data on the data partition, in `deploy/os/mkosi.local.conf` (git-ignored):
+
+   ```ini
+   [Content]
+   Packages=postgresql
+   ```
+
+   The Debian package starts a cluster `16/main` (trixie: 17) listening on `127.0.0.1:5432` with data in
+   `/var/lib/postgresql`. The root file system is read-only, so mount a directory of the data partition there: add
+   `/var/lib/orbit-cloud/postgresql /var/lib/postgresql none bind,x-systemd.requires-mounts-for=/var/lib/orbit-cloud 0 0` to
+   `mkosi.extra/etc/fstab` and create it owned by `postgres` with a `tmpfiles.d` line
+   (`d /var/lib/orbit-cloud/postgresql 0700 postgres postgres -`; `orbit-data` is mounted `noexec`, which PostgreSQL does not need).
+   Set the `postgres` role's password once on the running system (`runuser -u postgres -- psql -c "alter role postgres
+   password '...'"`) and keep `scram-sha-256` in `pg_hba.conf` for `127.0.0.1`.
+2. Pass the admin URL as a credential, next to the token:
+
+   ```sh
+   mkosi --credential=orbit-cloud.token=secret \
+         --credential=orbit-cloud.postgres-url=postgres://postgres:PASSWORD@127.0.0.1:5432/postgres qemu
+   ```
+
+   `orbitd-start` exports it as `ORBIT_CLOUD_POSTGRES_URL`. Without the credential PostgreSQL provisioning is off and
+   specs with `"postgres": true` are refused.
+
+Apps then connect to `127.0.0.1:5432` (that is what the connect grant names). This recipe has not been built in CI, like the
+rest of the image; see `docs/postgres.md` for what orbitd provisions.
+
 ## Status
 
 The recipe is reviewed against the mkosi and systemd documentation but has not been built in CI: that needs root,
