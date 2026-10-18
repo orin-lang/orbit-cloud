@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequest as _, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -133,6 +133,22 @@ pub fn routes() -> Router<AppState> {
 }
 
 // ------------------------------------------------------------------------------------------------ json
+
+/// A JSON request body, accepted with or without a `Content-Type` (curl and small scripts often omit it).
+pub struct Jb<T>(pub T);
+
+impl<S: Send + Sync, T: serde::de::DeserializeOwned> axum::extract::FromRequest<S> for Jb<T> {
+    type Rejection = ApiError;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, ApiError> {
+        let bytes = axum::body::Bytes::from_request(req, state)
+            .await
+            .map_err(|e| ApiError::bad(format!("body: {e}")))?;
+        serde_json::from_slice(&bytes)
+            .map(Jb)
+            .map_err(|e| ApiError::bad(format!("body: {e}")))
+    }
+}
 
 fn user_json(u: &User) -> Value {
     json!({ "id": u.id, "email": u.email, "display_name": u.display_name, "is_admin": u.is_admin, "created_at": u.created_at })
@@ -401,7 +417,7 @@ async fn list_users(State(s): State<AppState>, authz: Authz) -> ApiResult<Json<V
 async fn create_user(
     State(s): State<AppState>,
     authz: Authz,
-    Json(b): Json<NewUser>,
+    Jb(b): Jb<NewUser>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     authz.require_instance()?;
     if b.password.chars().count() < MIN_PASSWORD {
@@ -475,7 +491,7 @@ struct NewOrg {
 async fn create_org(
     State(s): State<AppState>,
     authz: Authz,
-    Json(b): Json<NewOrg>,
+    Jb(b): Jb<NewOrg>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     authz.require_instance()?;
     let org = s.store().create_org(&b.name)?;
@@ -563,7 +579,7 @@ async fn add_member(
     State(s): State<AppState>,
     authz: Authz,
     Path(name): Path<String>,
-    Json(b): Json<MemberBody>,
+    Jb(b): Jb<MemberBody>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let org = authz.require_org(&name, Perm::Manage)?;
     let role = parse_role(&b.role)?;
@@ -594,7 +610,7 @@ async fn update_member(
     State(s): State<AppState>,
     authz: Authz,
     Path((name, uid)): Path<(String, String)>,
-    Json(b): Json<MemberBody>,
+    Jb(b): Jb<MemberBody>,
 ) -> ApiResult<Json<Value>> {
     let org = authz.require_org(&name, Perm::Manage)?;
     let role = parse_role(&b.role)?;
@@ -711,7 +727,7 @@ struct NewProject {
 async fn create_project(
     State(s): State<AppState>,
     authz: Authz,
-    Json(b): Json<NewProject>,
+    Jb(b): Jb<NewProject>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let org_name = match b.org {
         Some(o) => o,
@@ -804,7 +820,7 @@ async fn add_domain(
     State(s): State<AppState>,
     authz: Authz,
     Path(project): Path<String>,
-    Json(b): Json<NewDomain>,
+    Jb(b): Jb<NewDomain>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let p = authz.require_project(&project, Perm::Manage)?;
     let host = domains::validate_domain(&b.host, s.platform.base_domain.as_deref())
@@ -930,7 +946,7 @@ async fn add_route(
     State(s): State<AppState>,
     authz: Authz,
     Path(project): Path<String>,
-    Json(b): Json<NewRoute>,
+    Jb(b): Jb<NewRoute>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let p = authz.require_project(&project, Perm::Write)?;
     if !oc_store::valid_name(&b.app) {
@@ -1018,7 +1034,7 @@ struct NewToken {
 async fn create_token(
     State(s): State<AppState>,
     authz: Authz,
-    Json(b): Json<NewToken>,
+    Jb(b): Jb<NewToken>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     if matches!(authz.principal, Principal::Token(_)) {
         return Err(ApiError::new(

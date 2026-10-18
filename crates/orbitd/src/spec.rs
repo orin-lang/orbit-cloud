@@ -249,6 +249,23 @@ mod tests {
     }
 
     #[test]
+    fn http_services_get_a_loopback_port_and_env() {
+        let s: Spec =
+            serde_json::from_value(serde_json::json!({"kind": "service", "http": true})).unwrap();
+        s.validate().unwrap();
+        let s = s.with_http_port(20123);
+        assert_eq!(s.env.get("PORT").map(String::as_str), Some("20123"));
+        assert_eq!(s.listen, vec!["127.0.0.1:20123".to_owned()]);
+        let g = s.grants("app", None, None).unwrap();
+        assert!(
+            g.contains(&CapabilityId::net_v1()),
+            "the port is granted to listen on"
+        );
+        let job: Spec = serde_json::from_value(serde_json::json!({"http": true})).unwrap();
+        assert!(job.validate().is_err(), "http is for services");
+    }
+
+    #[test]
     fn grants_are_deny_by_default() {
         let s = Spec::default();
         let g = s.grants("app", None, None).unwrap();
