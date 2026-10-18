@@ -1,0 +1,307 @@
+// The hub: ONE task that owns every piece of mutable state of the console. Orin tasks share no mutable state, so the
+// sessions of the live UI and the logins live in this task's loop and the request handlers (which run on the server's worker
+// tasks) reach it through a channel, one command at a time. A command is atomic because the hub handles one at a time.
+//
+//   UI sessions   a session is the Model the browser shows plus a message counter; the tree is rebuilt from the model (a view is
+//                 a pure function), so nothing but plain data crosses the channel. The counter numbers the messages sent to the
+//                 browser (see "Ordered delivery" in orin-ui's docs/design.md).
+//   logins        opaque ids handed out by /login, checked on every request.
+import { Sender, Receiver, channel } from "std:task";
+import {
+  Program, Session, sessionOf, sendAll, messageAt, ClientEvent, patchMessageSeq, mountMessageSeq,
+} from "orin-ui";
+import { Model, Msg } from "./model";
+
+export type Entry = { id: string; model: Model; next: int; touched: int; };
+
+export type Resolved = { msg: Msg; model: Model; };
+
+export type Op =
+  OpNew(Model)
+  | OpResolve(string, ClientEvent)
+  | OpApply(string, Msg[])
+  | OpJoin(string)
+  | OpPeek(string)
+  | OpLogin
+  | OpCheck(string)
+  | OpLogout(string);
+
+export type Reply =
+  RNew(string)
+  | RResolved(Option<Resolved>)
+  | RText(Option<string>)
+  | RModel(Option<Model>)
+  | RToken(string)
+  | RFlag(bool);
+
+export type Command = { op: Op; reply: Sender<Reply>; };
+
+export type Hub = Sender<Command>;
+
+// How many UI sessions are kept; the least recently used one is dropped for a new one.
+export function maxSessions(): int {
+  return 256;
+}
+
+export function maxLogins(): int {
+  return 64;
+}
+
+// ------------------------------------------------------------------ tokens
+
+// A login token is 32 hex digits (16 random bytes) taken from the entropy pool main read from /dev/urandom at start-up. The
+// language has no random generator and no bit operations to build a good one, so the console does not pretend to: when the pool
+// is used up it refuses further logins (`RToken("")`) and the operator restarts it. UI session ids are plain counters; they
+// are only reachable with a valid login anyway.
+export function tokenLength(): usize {
+  return 32;
+}
+
+// ------------------------------------------------------------------ the loop
+
+type State = {
+  sessions: Entry[];
+  logins: string[];
+  entropy: string;
+  used: usize;
+  clock: int;
+  counter: int;
+};
+
+function indexOfSession(st: State, id: string): Option<usize> {
+  let i: usize = 0;
+  while (i < st.sessions.length) {
+    if (st.sessions[i].id == id) {
+      return Some(i);
+    }
+    i += 1;
+  }
+  return None;
+}
+
+function oldest(sessions: Entry[]): usize {
+  let best: usize = 0;
+  let i: usize = 1;
+  while (i < sessions.length) {
+    if (sessions[i].touched < sessions[best].touched) {
+      best = i;
+    }
+    i += 1;
+  }
+  return best;
+}
+
+function nextClock(st: State): State {
+  return State { ...st, clock: st.clock + 1 };
+}
+
+function withEntry(st: State, i: usize, e: Entry): State {
+  let all = st.sessions;
+  all[i] = e;
+  return State { ...st, sessions: all };
+}
+
+// Runs the hub until the channel is closed and drained. `program` is the console's orin-ui program (a value).
+export function hubLoop(
+  commands: Receiver<Command>,
+  entropy: string,
+  program: Program<Model, Msg>,
+): int {
+  let st = State { sessions: [], logins: [], entropy: entropy, used: 0, clock: 0, counter: 0 };
+  let handled: int = 0;
+  let going = true;
+  while (going) {
+    const next = commands.recv();
+    match (next) {
+      Some(c) => {
+        st = step(st, c, program);
+        handled += 1;
+      },
+      None => {
+        going = false;
+      },
+    }
+  }
+  return handled;
+}
+
+function step(st0: State, c: Command, program: Program<Model, Msg>): State {
+  const st = nextClock(st0);
+  return match (c.op) {
+    OpNew(model) => {
+      const id = "s" + st.counter.toString();
+      let all = st.sessions;
+      if (all.length >= maxSessions().toUsize()) {
+        const k = oldest(all);
+        all[k] = Entry { id: id, model: model, next: 0, touched: st.clock };
+      } else {
+        all.push(Entry { id: id, model: model, next: 0, touched: st.clock });
+      }
+      c.reply.send(RNew(id));
+      return State { ...st, sessions: all, counter: st.counter + 1 };
+    },
+    OpResolve(id, ev) => {
+      const i = indexOfSession(st, id);
+      if (i.isNone()) {
+        c.reply.send(RResolved(None));
+        return st;
+      }
+      const e = st.sessions[i.unwrap()];
+      const session = sessionOf<Model, Msg>(program, e.model);
+      const msg = messageAt<Msg>(session.tree, ev.path, ev.event, ev.value);
+      c.reply.send(
+        RResolved(msg.isSome() ? Some(Resolved { msg: msg.unwrap(), model: e.model }) : None),
+      );
+      return withEntry(st, i.unwrap(), Entry { ...e, touched: st.clock });
+    },
+    OpApply(id, msgs) => {
+      const i = indexOfSession(st, id);
+      if (i.isNone()) {
+        c.reply.send(RText(None));
+        return st;
+      }
+      const e = st.sessions[i.unwrap()];
+      const before = sessionOf<Model, Msg>(program, e.model);
+      const stepped = sendAll<Model, Msg>(program, before, msgs);
+      c.reply.send(RText(Some(patchMessageSeq(stepped.patches, e.next))));
+      return withEntry(
+        st,
+        i.unwrap(),
+        Entry { id: e.id, model: stepped.session.model, next: e.next + 1, touched: st.clock },
+      );
+    },
+    OpJoin(id) => {
+      const i = indexOfSession(st, id);
+      if (i.isNone()) {
+        c.reply.send(RText(None));
+        return st;
+      }
+      const e = st.sessions[i.unwrap()];
+      const s = sessionOf<Model, Msg>(program, e.model);
+      c.reply.send(RText(Some(mountMessageSeq(s.dom, e.next))));
+      return withEntry(st, i.unwrap(), Entry { ...e, next: e.next + 1, touched: st.clock });
+    },
+    OpPeek(id) => {
+      const i = indexOfSession(st, id);
+      c.reply.send(RModel(i.isSome() ? Some(st.sessions[i.unwrap()].model) : None));
+      return st;
+    },
+    OpLogin => {
+      const end = st.used + tokenLength();
+      if (end > st.entropy.length) {
+        c.reply.send(RToken(""));
+        return st;
+      }
+      const token = st.entropy.substring(st.used, end);
+      let all = st.logins;
+      if (all.length >= maxLogins().toUsize()) {
+        all = all.slice(1, all.length);
+      }
+      all.push(token);
+      c.reply.send(RToken(token));
+      return State { ...st, logins: all, used: end };
+    },
+    OpCheck(token) => {
+      c.reply.send(RFlag(token.length > 0 && st.logins.includes(token)));
+      return st;
+    },
+    OpLogout(token) => {
+      c.reply.send(RFlag(true));
+      return State { ...st, logins: st.logins.filter(t => t != token) };
+    },
+  };
+}
+
+// ------------------------------------------------------------------ the handlers' side
+
+function ask(hub: Hub, op: Op): Option<Reply> {
+  const reply = channel<Reply>(1);
+  const sent = hub.send(Command { op: op, reply: reply.tx });
+  if (sent.isErr()) {
+    return None;
+  }
+  const got = reply.rx.recv();
+  reply.rx.close();
+  reply.tx.close();
+  return got;
+}
+
+// A new UI session showing `model`; its id. None when the hub is gone.
+export function newSession(hub: Hub, model: Model): Option<string> {
+  const r = ask(hub, OpNew(model));
+  if (r.isNone()) {
+    return None;
+  }
+  return match (r.unwrap()) {
+    RNew(id) => Some(id),
+    _ => None,
+  };
+}
+
+export function resolveEvent(hub: Hub, id: string, ev: ClientEvent): Option<Resolved> {
+  const r = ask(hub, OpResolve(id, ev));
+  if (r.isNone()) {
+    return None;
+  }
+  return match (r.unwrap()) {
+    RResolved(x) => x,
+    _ => None,
+  };
+}
+
+function textOf(r: Option<Reply>): Option<string> {
+  if (r.isNone()) {
+    return None;
+  }
+  return match (r.unwrap()) {
+    RText(t) => t,
+    _ => None,
+  };
+}
+
+// Applies messages to the session's model; the numbered patch message for the browser. None: unknown session.
+export function applyMessages(hub: Hub, id: string, msgs: Msg[]): Option<string> {
+  return textOf(ask(hub, OpApply(id, msgs)));
+}
+
+// The numbered mount message that shows the session's whole screen.
+export function joinSession(hub: Hub, id: string): Option<string> {
+  return textOf(ask(hub, OpJoin(id)));
+}
+
+export function peekModel(hub: Hub, id: string): Option<Model> {
+  const r = ask(hub, OpPeek(id));
+  if (r.isNone()) {
+    return None;
+  }
+  return match (r.unwrap()) {
+    RModel(m) => m,
+    _ => None,
+  };
+}
+
+export function login(hub: Hub): Option<string> {
+  const r = ask(hub, OpLogin);
+  if (r.isNone()) {
+    return None;
+  }
+  return match (r.unwrap()) {
+    RToken(t) => t.length > 0 ? Some(t) : None,
+    _ => None,
+  };
+}
+
+export function isLoggedIn(hub: Hub, token: string): bool {
+  const r = ask(hub, OpCheck(token));
+  if (r.isNone()) {
+    return false;
+  }
+  return match (r.unwrap()) {
+    RFlag(b) => b,
+    _ => false,
+  };
+}
+
+export function logout(hub: Hub, token: string): void {
+  ask(hub, OpLogout(token));
+}

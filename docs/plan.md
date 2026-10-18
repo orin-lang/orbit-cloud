@@ -91,6 +91,10 @@ token or the users of milestone 2 map onto it) comes later, together with the fi
 API and console of milestone 1 stay as they are, and the `/v1` HTTP API is the compatibility surface the Orin version
 has to keep.
 
+The console is the first piece: [`console/`](../console/README.md) is an Orin program on `orin-web` and `orin-ui` that runs
+natively next to `orbitd` and uses only the `/v1` API (no new host capability). Running it as a system app on Orbit is blocked
+on `std:net`/`std:http` for `wasm32-orbit` and on request delivery to wasm apps.
+
 ## Deployment shapes
 
 * **Docker**: `docker run -p 8080:8080 -v orbit-data:/var/lib/orbit-cloud -e ORBIT_CLOUD_TOKEN=... ghcr.io/orin-lang/orbit-cloud`.

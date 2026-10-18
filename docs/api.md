@@ -230,4 +230,5 @@ scrape_configs:
 ## Console
 
 `GET /` serves the web console (apps, runs, traces, logs, queues); it calls this API with the token you enter. It is
-planned to be replaced by an Orin app, see [plan.md](plan.md#control-plane-in-orin).
+planned to be replaced by an Orin app, see [plan.md](plan.md#control-plane-in-orin). A first version of that app exists in
+[`console/`](../console/README.md): it uses only the API above.

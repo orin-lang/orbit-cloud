@@ -1,0 +1,121 @@
+// The hub: sessions, numbering, eviction, logins.
+import { assert, assertEq, assertEqString } from "std:test";
+import { Scope, scope, spawn, channel } from "std:task";
+import { ClientEvent } from "orin-ui";
+import {
+  Command, Hub, hubLoop, newSession, resolveEvent, applyMessages, joinSession, peekModel, login,
+  isLoggedIn, logout, maxSessions,
+} from "../src/hub";
+import {
+  initialModel, LogsPage, NoticePage, Notice, goodFlash, ToggleFollow, Noop,
+} from "../src/model";
+import { program } from "../src/program";
+import { entropy } from "./support";
+
+function withHub(body: (hub: Hub) => void): void {
+  scope((s: Scope): void => {
+    const cmds = channel<Command>(16);
+    const rx = cmds.rx;
+    const task = spawn(s, (): int => hubLoop(rx, entropy(), program()));
+    body(cmds.tx);
+    cmds.tx.close();
+    task.join();
+  });
+}
+
+@Test
+function sessionsHoldTheirOwnModel(): void {
+  withHub(hub => {
+    const a = newSession(hub, initialModel(LogsPage)).unwrap();
+    const b = newSession(hub, initialModel(NoticePage("t", "x", false))).unwrap();
+    assert(a != b, "distinct ids");
+    applyMessages(hub, a, [Notice(goodFlash("hello", ""))]);
+    assertEqString(peekModel(hub, a).unwrap().flash.text, "hello", "a changed");
+    assertEqString(peekModel(hub, b).unwrap().flash.text, "", "b did not");
+    assert(peekModel(hub, "nope").isNone(), "unknown session");
+  });
+}
+
+@Test
+function messagesAreNumberedInTheOrderTheyWereComputed(): void {
+  withHub(hub => {
+    const a = newSession(hub, initialModel(LogsPage)).unwrap();
+    assert(
+      applyMessages(hub, a, [Noop]).unwrap().startsWith("{\"t\":\"patch\",\"n\":0,"),
+      "first is 0",
+    );
+    assert(
+      applyMessages(hub, a, [ToggleFollow]).unwrap().startsWith("{\"t\":\"patch\",\"n\":1,"),
+      "second is 1",
+    );
+    assert(
+      joinSession(hub, a).unwrap().startsWith("{\"t\":\"mount\",\"n\":2,"),
+      "a mount takes the next number too",
+    );
+    assert(
+      applyMessages(hub, a, [Noop]).unwrap().startsWith("{\"t\":\"patch\",\"n\":3,"),
+      "and the count goes on",
+    );
+    assert(applyMessages(hub, "nope", [Noop]).isNone(), "unknown session");
+    assert(joinSession(hub, "nope").isNone(), "unknown join");
+  });
+}
+
+@Test
+function anEventResolvesToTheMessageOfItsElement(): void {
+  withHub(hub => {
+    const a = newSession(hub, initialModel(LogsPage)).unwrap();
+    // [0,1,1,4] is the Follow button of the logs page
+    const r = resolveEvent(hub, a, ClientEvent { path: [0, 1, 1, 4], event: "click", value: "" });
+    assert(r.isSome(), "found");
+    assert(
+      resolveEvent(hub, a, ClientEvent { path: [0, 1, 1, 4], event: "dblclick", value: "" }).isNone(),
+      "no such event",
+    );
+    assert(
+      resolveEvent(hub, a, ClientEvent { path: [9, 9], event: "click", value: "" }).isNone(),
+      "no such element",
+    );
+    assert(
+      resolveEvent(hub, "nope", ClientEvent { path: [0], event: "click", value: "" }).isNone(),
+      "no such session",
+    );
+  });
+}
+
+@Test
+function theLeastRecentlyUsedSessionIsDropped(): void {
+  withHub(hub => {
+    const first = newSession(hub, initialModel(LogsPage)).unwrap();
+    const second = newSession(hub, initialModel(LogsPage)).unwrap();
+    let i: int = 2;
+    while (i < maxSessions()) {
+      newSession(hub, initialModel(LogsPage));
+      i += 1;
+    }
+    peekModel(hub, first);
+    applyMessages(hub, first, [Noop]); // touches `first`
+    newSession(hub, initialModel(LogsPage)); // one too many: `second` is the oldest
+    assert(peekModel(hub, first).isSome(), "the recently used one stays");
+    assert(peekModel(hub, second).isNone(), "the oldest went");
+  });
+}
+
+@Test
+function loginsAreOpaqueRevocableAndLimitedByEntropy(): void {
+  withHub(hub => {
+    const t1 = login(hub).unwrap();
+    const t2 = login(hub).unwrap();
+    assertEqString(t1, "00112233445566778899aabbccddeeff", "first token comes from the pool");
+    assert(t1 != t2, "distinct");
+    assert(isLoggedIn(hub, t1) && isLoggedIn(hub, t2), "valid");
+    assert(!isLoggedIn(hub, ""), "empty is never valid");
+    assert(!isLoggedIn(hub, "guess"), "unknown");
+    logout(hub, t1);
+    assert(!isLoggedIn(hub, t1), "revoked");
+    assert(isLoggedIn(hub, t2), "others stay");
+    const t3 = login(hub);
+    assert(t3.isSome(), "third");
+    assert(login(hub).isNone(), "the pool is used up: no more logins");
+  });
+}

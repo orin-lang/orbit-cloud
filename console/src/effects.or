@@ -1,0 +1,275 @@
+// What the console does against orbitd. `loadPage` builds the data of a screen for the first render; `perform` turns a user's
+// message into API calls and returns the messages that tell `update` what happened.
+import { Api } from "./api";
+import {
+  listApps, getApp, appRuns, recentRuns, getRun, runTrace, runLogs, kvNamespaces, kvEntries,
+  activate, runNow, deleteApp, listQueues, deadLetters, redrive, publish, logsAfter,
+} from "./api";
+import { KvView, DeadView } from "./types";
+import {
+  Model, Msg, Page, AppView, RunView, QueuesView, LogFilter, AppsPage, AppPage, RunsPage, RunPage,
+  LogsPage, QueuesPage, NoticePage, Noop, Refresh, RunNow, AskDelete, CancelDelete, ConfirmDelete,
+  Activate, ShowKv, HideKv, Redrive, ShowDead, HideDead, PublishForm, FilterForm, ToggleFollow,
+  ClearLines, Show, Notice, ShowKvEntries, ShowDeadLetters, LinesArrived, StreamFailed, formField,
+  goodFlash, badFlash, noFlash, filterFromForm, update, Flash,
+} from "./model";
+
+// Which screen a URL names.
+export type Route =
+  RouteApps
+  | RouteApp(string)
+  | RouteRuns
+  | RouteRun(string)
+  | RouteLogs
+  | RouteQueues;
+
+function runLimit(): int {
+  return 100;
+}
+
+export function loadApp(api: Api, name: string): Result<AppView, string> {
+  const detail = getApp(api, name)?;
+  const runs = appRuns(api, name, 20)?;
+  const ns = kvNamespaces(api, name)?;
+  return Ok(AppView { detail: detail, runs: runs, namespaces: ns, kv: None, confirmDelete: false });
+}
+
+export function loadRun(api: Api, id: string): Result<RunView, string> {
+  const run = getRun(api, id)?;
+  const spans = runTrace(api, id)?;
+  const logs = runLogs(api, id, 2000)?;
+  return Ok(RunView { run: run, spans: spans, logs: logs });
+}
+
+// The queues page; `deadOf` names the queue whose dead letters stay open ("" for none).
+export function loadQueues(
+  api: Api,
+  deadOf: string,
+  formQueue: string,
+  formBody: string,
+  formGen: int,
+): Result<QueuesView, string> {
+  const qs = listQueues(api)?;
+  let dead: Option<DeadView> = None;
+  if (deadOf.length > 0) {
+    const letters = deadLetters(api, deadOf, 100)?;
+    dead = Some(DeadView { queue: deadOf, letters: letters });
+  }
+  return Ok(QueuesView {
+    queues: qs,
+    dead: dead,
+    formQueue: formQueue,
+    formBody: formBody,
+    formGen: formGen,
+  });
+}
+
+export function loadPage(api: Api, route: Route): Result<Page, string> {
+  return match (route) {
+    RouteApps => Ok(AppsPage(listApps(api)?)),
+    RouteApp(name) => Ok(AppPage(loadApp(api, name)?)),
+    RouteRuns => Ok(RunsPage(recentRuns(api, runLimit())?)),
+    RouteRun(id) => Ok(RunPage(loadRun(api, id)?)),
+    RouteLogs => Ok(LogsPage),
+    RouteQueues => Ok(QueuesPage(loadQueues(api, "", "", "", 0)?)),
+  };
+}
+
+// True when an error text from the API layer is a 404 of orbitd (an app or run that does not exist).
+export function isNotFound(message: string): bool {
+  return message.endsWith("(404)");
+}
+
+function fail(e: string): Msg[] {
+  return [Notice(badFlash(e))];
+}
+
+// Re-reads the page the model shows.
+function reload(api: Api, m: Model): Result<Page, string> {
+  return match (m.page) {
+    AppsPage(xs) => loadPage(api, RouteApps),
+    AppPage(v) => loadPage(api, RouteApp(v.detail.name)),
+    RunsPage(xs) => loadPage(api, RouteRuns),
+    RunPage(v) => loadPage(api, RouteRun(v.run.id)),
+    LogsPage => Ok(LogsPage),
+    QueuesPage(v) => Ok(
+      QueuesPage(
+        loadQueues(
+          api,
+          v.dead.isSome() ? v.dead.unwrap().queue : "",
+          v.formQueue,
+          v.formBody,
+          v.formGen,
+        )?,
+      ),
+    ),
+    NoticePage(a, b, c) => Ok(m.page),
+  };
+}
+
+// The first lines of a followed log; later ones come from the stream.
+export function fetchLines(api: Api, f: LogFilter, after: int, limit: int): Result<Msg[], string> {
+  const lines = logsAfter(api, f.app, f.level, f.contains, after, limit)?;
+  return Ok(lines.length > 0 ? [LinesArrived(lines)] : []);
+}
+
+// The messages that follow a user message `msg` against the model `m` (the state before `msg` is applied).
+export function perform(api: Api, m: Model, msg: Msg): Msg[] {
+  return match (msg) {
+    Refresh => reloadMsgs(api, m, noFlash()),
+    RunNow => match (m.page) {
+      AppPage(v) => runAndReload(api, v.detail.name),
+      _ => [],
+    },
+    ConfirmDelete => match (m.page) {
+      AppPage(v) => deleteAndLeave(api, v.detail.name),
+      _ => [],
+    },
+    Activate(id) => match (m.page) {
+      AppPage(v) => activateAndReload(api, v.detail.name, id),
+      _ => [],
+    },
+    ShowKv(ns) => match (m.page) {
+      AppPage(v) => showKv(api, v.detail.name, ns),
+      _ => [],
+    },
+    Redrive(q) => redriveAndReload(api, m, q),
+    ShowDead(q) => showDead(api, q),
+    PublishForm(encoded) => publishAndReload(api, m, encoded),
+    FilterForm(encoded) => m.logs.following ? firstLines(api, filterFromForm(encoded)) : [],
+    ToggleFollow => m.logs.following ? [] : firstLines(api, m.logs.filter),
+    _ => [],
+  };
+}
+
+function firstLines(api: Api, f: LogFilter): Msg[] {
+  const r = fetchLines(api, f, 0, 100);
+  return r.isOk() ? r.unwrap() : fail(r.unwrapErr());
+}
+
+function reloadMsgs(api: Api, m: Model, flash: Flash): Msg[] {
+  const p = reload(api, m);
+  if (p.isErr()) {
+    return fail(p.unwrapErr());
+  }
+  return [Show(p.unwrap()), Notice(flash)];
+}
+
+function runAndReload(api: Api, app: string): Msg[] {
+  const r = runNow(api, app);
+  if (r.isErr()) {
+    return fail(r.unwrapErr());
+  }
+  const run = r.unwrap();
+  const v = loadApp(api, app);
+  const text = "Run " + run.id + " " + run.status
+      + (run.exitCode.isSome() ? ", exit " + run.exitCode.unwrap().toString() : "");
+  const flash = run.status == "succeeded"
+      ? goodFlash(text, "/runs/" + run.id)
+      : Flash { text: text, href: "/runs/" + run.id, bad: true };
+  if (v.isErr()) {
+    return [Notice(flash)];
+  }
+  return [Show(AppPage(v.unwrap())), Notice(flash)];
+}
+
+function deleteAndLeave(api: Api, app: string): Msg[] {
+  const r = deleteApp(api, app);
+  if (r.isErr()) {
+    return fail(r.unwrapErr());
+  }
+  return [
+    Show(
+      NoticePage(
+        "Deleted " + app,
+        "The app, its deployments, runs, logs and data are gone.",
+        false,
+      ),
+    ),
+    Notice(noFlash()),
+  ];
+}
+
+function activateAndReload(api: Api, app: string, id: int): Msg[] {
+  const r = activate(api, app, id);
+  if (r.isErr()) {
+    return fail(r.unwrapErr());
+  }
+  const v = loadApp(api, app);
+  if (v.isErr()) {
+    return fail(v.unwrapErr());
+  }
+  return [
+    Show(AppPage(v.unwrap())),
+    Notice(goodFlash("Deployment " + id.toString() + " is active", "")),
+  ];
+}
+
+function showKv(api: Api, app: string, ns: string): Msg[] {
+  const r = kvEntries(api, app, ns, 200);
+  if (r.isErr()) {
+    return fail(r.unwrapErr());
+  }
+  return [ShowKvEntries(KvView { namespace: ns, entries: r.unwrap() })];
+}
+
+function redriveAndReload(api: Api, m: Model, q: string): Msg[] {
+  const r = redrive(api, q);
+  if (r.isErr()) {
+    return fail(r.unwrapErr());
+  }
+  const form = match (m.page) {
+    QueuesPage(v) => v,
+    _ => QueuesView { queues: [], dead: None, formQueue: "", formBody: "", formGen: 0 },
+  };
+  const v = loadQueues(
+    api,
+    form.dead.isSome() ? form.dead.unwrap().queue : "",
+    form.formQueue,
+    form.formBody,
+    form.formGen,
+  );
+  if (v.isErr()) {
+    return fail(v.unwrapErr());
+  }
+  return [
+    Show(QueuesPage(v.unwrap())),
+    Notice(goodFlash("Redrove " + r.unwrap().toString() + " dead letter(s) of " + q, "")),
+  ];
+}
+
+function showDead(api: Api, q: string): Msg[] {
+  const r = deadLetters(api, q, 100);
+  if (r.isErr()) {
+    return fail(r.unwrapErr());
+  }
+  return [ShowDeadLetters(DeadView { queue: q, letters: r.unwrap() })];
+}
+
+function publishAndReload(api: Api, m: Model, encoded: string): Msg[] {
+  const queue = formField(encoded, "queue").trim();
+  const body = formField(encoded, "body");
+  if (queue.length == 0) {
+    return fail("Give the queue a name (a-z, 0-9, -)");
+  }
+  const r = publish(api, queue, body);
+  if (r.isErr()) {
+    return fail(r.unwrapErr());
+  }
+  const dead = match (m.page) {
+    QueuesPage(v) => v.dead.isSome() ? v.dead.unwrap().queue : "",
+    _ => "",
+  };
+  const gen = match (m.page) {
+    QueuesPage(v) => v.formGen + 1,
+    _ => 0,
+  };
+  const v = loadQueues(api, dead, "", "", gen);
+  if (v.isErr()) {
+    return fail(v.unwrapErr());
+  }
+  return [
+    Show(QueuesPage(v.unwrap())),
+    Notice(goodFlash("Queued message " + r.unwrap().toString() + " on " + queue, "")),
+  ];
+}

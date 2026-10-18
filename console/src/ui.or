@@ -1,0 +1,78 @@
+// The OX provider of the console: `import ox from "./ui";` in a view file makes `<div>` call `div` below. An OX provider has to
+// be non-generic, so the message type is fixed here (see orin-ui's docs/compiler-issues.md, item 1). Every element has the same
+// shape: optional `attrs` (a list of orin-ui attributes) and the `children`.
+import { Components } from "std:ox";
+import { Node, Attr, Element, Text, Fragment } from "orin-ui";
+import { Msg } from "./model";
+
+export function ox(): Components<Node<Msg>> {
+  return Components<Node<Msg>> { fragment: group, text: plain };
+}
+
+export function group(items: Node<Msg>[]): Node<Msg> {
+  return Fragment(items);
+}
+export function plain(s: string): Node<Msg> {
+  return Text(s);
+}
+
+export function div(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("div", attrs.unwrapOr([]), children);
+}
+export function span(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("span", attrs.unwrapOr([]), children);
+}
+export function h2(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("h2", attrs.unwrapOr([]), children);
+}
+export function p(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("p", attrs.unwrapOr([]), children);
+}
+export function a(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("a", attrs.unwrapOr([]), children);
+}
+export function button(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("button", attrs.unwrapOr([]), children);
+}
+export function form(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("form", attrs.unwrapOr([]), children);
+}
+export function label(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("label", attrs.unwrapOr([]), children);
+}
+export function input(attrs: Option<Attr<Msg>[]>): Node<Msg> {
+  return Element("input", attrs.unwrapOr([]), []);
+}
+export function select(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("select", attrs.unwrapOr([]), children);
+}
+export function option(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("option", attrs.unwrapOr([]), children);
+}
+export function table(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("table", attrs.unwrapOr([]), children);
+}
+export function thead(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("thead", attrs.unwrapOr([]), children);
+}
+export function tbody(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("tbody", attrs.unwrapOr([]), children);
+}
+export function tr(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("tr", attrs.unwrapOr([]), children);
+}
+export function th(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("th", attrs.unwrapOr([]), children);
+}
+export function td(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("td", attrs.unwrapOr([]), children);
+}
+export function pre(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("pre", attrs.unwrapOr([]), children);
+}
+export function code(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("code", attrs.unwrapOr([]), children);
+}
+export function strong(attrs: Option<Attr<Msg>[]>, children: Node<Msg>[]): Node<Msg> {
+  return Element("strong", attrs.unwrapOr([]), children);
+}

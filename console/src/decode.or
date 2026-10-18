@@ -1,0 +1,137 @@
+// JSON from the API to the console's types. Tolerant: see jv.or.
+import { JsonValue } from "std:json";
+import { items, member, strOr, intOr, boolOr, optStr, optInt, jsonText } from "./jv";
+import {
+  AppSummary, Deployment, AppDetail, Run, Span, LogLine, KvNamespace, KvEntry, Queue, DeadLetter,
+} from "./types";
+
+export function decodeApps(v: JsonValue): AppSummary[] {
+  return items(v).map(
+    a => AppSummary {
+      name: strOr(a, "name", ""),
+      kind: strOr(a, "kind", "job"),
+      version: intOr(a, "version", 0),
+      workerRunning: boolOr(a, "worker_running", false),
+      createdAt: intOr(a, "created_at", 0),
+    },
+  );
+}
+
+function decodeDeployment(d: JsonValue): Deployment {
+  const spec = member(d, "spec");
+  return Deployment {
+    id: intOr(d, "id", 0),
+    version: intOr(d, "version", 0),
+    module: strOr(d, "module", ""),
+    spec: jsonText(spec),
+    kind: strOr(spec, "kind", "job"),
+    createdAt: intOr(d, "created_at", 0),
+  };
+}
+
+export function decodeAppDetail(v: JsonValue): AppDetail {
+  const app = member(v, "app");
+  const ds = items(member(v, "deployments")).map(d => decodeDeployment(d));
+  const active = intOr(app, "active_deployment", 0);
+  let kind = "job";
+  for (const d of ds) {
+    if (d.id == active) {
+      kind = d.kind;
+    }
+  }
+  return AppDetail {
+    name: strOr(app, "name", ""),
+    createdAt: intOr(app, "created_at", 0),
+    activeDeployment: active,
+    kind: kind,
+    deployments: ds,
+    workerDeployment: intOr(v, "worker_deployment", 0),
+  };
+}
+
+export function decodeRun(r: JsonValue): Run {
+  return Run {
+    id: strOr(r, "id", ""),
+    app: strOr(r, "app", ""),
+    deployment: intOr(r, "deployment", 0),
+    trigger: strOr(r, "trigger", ""),
+    status: strOr(r, "status", ""),
+    exitCode: optInt(r, "exit_code"),
+    error: strOr(r, "error", ""),
+    startedAt: intOr(r, "started_at", 0),
+    wallMs: optInt(r, "wall_ms"),
+    fuel: optInt(r, "fuel"),
+    peakMemory: optInt(r, "peak_memory"),
+    traceId: strOr(r, "trace_id", ""),
+  };
+}
+
+export function decodeRuns(v: JsonValue): Run[] {
+  return items(v).map(r => decodeRun(r));
+}
+
+export function decodeSpans(v: JsonValue): Span[] {
+  return items(member(v, "spans")).map(
+    s => Span {
+      name: strOr(s, "name", ""),
+      parentId: optStr(s, "parent_id").unwrapOr(""),
+      startUs: intOr(s, "start_us", 0),
+      endUs: intOr(s, "end_us", 0),
+      attrs: jsonText(member(s, "attrs")),
+    },
+  );
+}
+
+export function decodeLogLine(l: JsonValue): LogLine {
+  return LogLine {
+    id: intOr(l, "id", 0),
+    app: strOr(l, "app", ""),
+    level: strOr(l, "level", "info"),
+    message: strOr(l, "message", ""),
+    ts: intOr(l, "ts", 0),
+    runId: optStr(l, "run_id").unwrapOr(""),
+  };
+}
+
+export function decodeLogs(v: JsonValue): LogLine[] {
+  return items(v).map(l => decodeLogLine(l));
+}
+
+export function decodeNamespaces(v: JsonValue): KvNamespace[] {
+  return items(v).map(
+    n => KvNamespace { namespace: strOr(n, "namespace", ""), entries: intOr(n, "entries", 0) },
+  );
+}
+
+export function decodeKvEntries(v: JsonValue): KvEntry[] {
+  return items(v).map(
+    e => KvEntry {
+      key: strOr(e, "key", ""),
+      value: strOr(e, "value", ""),
+      size: intOr(e, "size", 0),
+    },
+  );
+}
+
+export function decodeQueues(v: JsonValue): Queue[] {
+  return items(v).map(
+    q => Queue {
+      queue: strOr(q, "queue", ""),
+      ready: intOr(q, "ready", 0),
+      leased: intOr(q, "leased", 0),
+      dead: intOr(q, "dead", 0),
+      done: intOr(q, "done", 0),
+    },
+  );
+}
+
+export function decodeDead(v: JsonValue): DeadLetter[] {
+  return items(v).map(
+    m => DeadLetter {
+      id: intOr(m, "id", 0),
+      body: strOr(m, "body", ""),
+      attempts: intOr(m, "attempts", 0),
+      lastError: optStr(m, "last_error").unwrapOr(""),
+    },
+  );
+}

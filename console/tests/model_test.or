@@ -1,0 +1,120 @@
+// `update` and the form helpers: the pure core of the console.
+import { assert, assertEq, assertEqString } from "std:test";
+import { LogLine } from "../src/types";
+import {
+  Model, Msg, LogState, Flash, initialModel, update, formField, filterFromForm, appendLines,
+  maxLines, emptyLogs, LogsPage, Noop, ToggleFollow, FilterForm, ClearLines, LinesArrived,
+  StreamFailed, Notice, goodFlash, badFlash, noFlash,
+} from "../src/model";
+
+function line(id: int, app: string): LogLine {
+  return LogLine {
+    id: id,
+    app: app,
+    level: "info",
+    message: "m" + id.toString(),
+    ts: id,
+    runId: "",
+  };
+}
+
+@Test
+function formFieldsAreDecodedLikeAForm(): void {
+  const body = "queue=orders&body=%7B%22id%22%3A+1%7D&empty=";
+  assertEqString(formField(body, "queue"), "orders", "plain");
+  assertEqString(formField(body, "body"), "{\"id\": 1}", "percent and plus");
+  assertEqString(formField(body, "empty"), "", "empty");
+  assertEqString(formField(body, "missing"), "", "missing");
+  assertEqString(formField("bad=%zz", "bad"), "", "malformed escape reads as absent");
+}
+
+@Test
+function theFilterFormIsTrimmedAndComplete(): void {
+  const f = filterFromForm("app=+hello+&level=warn&contains=boom");
+  assertEqString(f.app, "hello", "app trimmed");
+  assertEqString(f.level, "warn", "level");
+  assertEqString(f.contains, "boom", "contains");
+  const none = filterFromForm("");
+  assertEqString(none.app + none.level + none.contains, "", "all empty");
+}
+
+@Test
+function noopChangesNothing(): void {
+  const m = initialModel(LogsPage);
+  const n = update(m, Noop);
+  assertEqString(n.flash.text, "", "flash");
+  assertEq(n.logs.lines.length.toInt(), 0, "lines");
+}
+
+@Test
+function noticesReplaceTheFlash(): void {
+  let m = initialModel(LogsPage);
+  m = update(m, Notice(goodFlash("done", "/runs/x")));
+  assertEqString(m.flash.text, "done", "text");
+  assertEqString(m.flash.href, "/runs/x", "link");
+  assert(!m.flash.bad, "good");
+  m = update(m, Notice(badFlash("oops")));
+  assert(m.flash.bad && m.flash.href.length == 0, "bad has no link");
+  m = update(m, Notice(noFlash()));
+  assertEqString(m.flash.text, "", "cleared");
+}
+
+@Test
+function followingStartsFromAnEmptyLogAndStopsKeepingIt(): void {
+  let m = initialModel(LogsPage);
+  m = update(m, ToggleFollow);
+  assert(m.logs.following, "following");
+  m = update(m, LinesArrived([line(1, "a"), line(2, "a")]));
+  assertEq(m.logs.lines.length.toInt(), 2, "two lines");
+  assertEq(m.logs.lastId, 2, "last id");
+  m = update(m, ToggleFollow);
+  assert(!m.logs.following, "paused");
+  assertEq(m.logs.lines.length.toInt(), 2, "the lines stay when paused");
+  m = update(m, ToggleFollow);
+  assertEq(m.logs.lines.length.toInt(), 0, "following again starts afresh");
+  assertEq(m.logs.lastId, 0, "from the start");
+}
+
+@Test
+function changingTheFilterRestartsTheLog(): void {
+  let m = initialModel(LogsPage);
+  m = update(m, ToggleFollow);
+  m = update(m, LinesArrived([line(5, "a")]));
+  m = update(m, FilterForm("app=b&level=error&contains="));
+  assertEqString(m.logs.filter.app, "b", "filter");
+  assertEq(m.logs.lines.length.toInt(), 0, "old lines gone");
+  assertEq(m.logs.lastId, 0, "from the start");
+  assert(m.logs.following, "still following");
+}
+
+@Test
+function clearingKeepsTheCursorSoOldLinesDoNotComeBack(): void {
+  let m = initialModel(LogsPage);
+  m = update(m, LinesArrived([line(1, "a"), line(2, "a")]));
+  m = update(m, ClearLines);
+  assertEq(m.logs.lines.length.toInt(), 0, "empty");
+  assertEq(m.logs.lastId, 2, "cursor kept");
+}
+
+@Test
+function theLogKeepsTheNewestLines(): void {
+  let s: LogState = emptyLogs();
+  let id: int = 1;
+  while (id <= 600) {
+    s = appendLines(s, [line(id, "a")]);
+    id += 1;
+  }
+  assertEq(s.lines.length.toInt(), maxLines(), "capped");
+  assertEq(s.lines[0].id, 101, "oldest kept");
+  assertEq(s.lines[s.lines.length - 1].id, 600, "newest kept");
+  assertEq(s.lastId, 600, "cursor");
+}
+
+@Test
+function aStreamErrorIsShownAndClearedByTheNextLines(): void {
+  let m = initialModel(LogsPage);
+  m = update(m, StreamFailed("orbitd is down"));
+  assertEqString(m.logs.error, "orbitd is down", "error");
+  m = update(m, LinesArrived([line(1, "a")]));
+  assertEqString(m.logs.error, "", "cleared");
+}

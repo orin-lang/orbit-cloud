@@ -1,0 +1,30 @@
+// A check that the console's portable core builds and runs for wasm32-orbit: the decoders, the effects, the model and the views,
+// driven by a canned Api, printing the first screen as HTML. It uses no std:net and no std:fs, unlike main.or (see README:
+// "WebAssembly"). Build it with `orin build --target=wasm32-orbit tools/wasm_check.or`.
+import { Api, ApiRequest, ApiResponse } from "../src/api";
+import { Route, RouteApps, RouteApp, loadPage } from "../src/effects";
+import { Model, initialModel, update, ToggleFollow, Msg } from "../src/model";
+import { program } from "../src/program";
+import { sessionOf, send, renderHtml, patchMessageSeq } from "orin-ui";
+
+function canned(): Api {
+  return (req: ApiRequest): Result<ApiResponse, string> => {
+    if (req.path == "/v1/apps") {
+      return Ok(ApiResponse {
+        status: 200,
+        body: "[{\"name\":\"hello\",\"kind\":\"job\",\"version\":1,\"worker_running\":false,\"created_at\":1792336579470}]",
+      });
+    }
+    return Ok(ApiResponse { status: 404, body: "{\"error\":\"not found\"}" });
+  };
+}
+
+function main(): void {
+  const page = loadPage(canned(), RouteApps).unwrap();
+  const model = initialModel(page);
+  const s = sessionOf<Model, Msg>(program(), model);
+  console.log(renderHtml(s.dom));
+  const next = send<Model, Msg>(program(), s, ToggleFollow);
+  console.log(patchMessageSeq(next.patches, 0));
+  console.log(loadPage(canned(), RouteApp("x")).unwrapErr());
+}

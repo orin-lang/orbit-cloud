@@ -1,0 +1,72 @@
+// Small formatting helpers for the views.
+import { formatIso } from "std:time";
+
+// "2026-10-18 12:00:01" (UTC) for a Unix time in milliseconds; "" for 0.
+export function dateTime(ms: int): string {
+  if (ms <= 0) {
+    return "";
+  }
+  const iso = formatIso(ms);
+  // the form is 2026-10-18T12:00:01.123Z or without milliseconds: show date and seconds
+  const t = iso.indexOf("T");
+  if (t.isNone()) {
+    return iso;
+  }
+  const date = iso.substring(0, t.unwrap());
+  const rest = iso.substring(t.unwrap() + 1, iso.length);
+  return date + " " + (rest.length >= 8 ? rest.substring(0, 8) : rest);
+}
+
+function two(n: int): string {
+  return n < 10 ? "0" + n.toString() : n.toString();
+}
+
+function three(n: int): string {
+  return n < 10 ? "00" + n.toString() : n < 100 ? "0" + n.toString() : n.toString();
+}
+
+// "12:00:01.123" (UTC time of day) for a Unix time in milliseconds.
+export function timeOfDay(ms: int): string {
+  const day = (ms % 86400000 + 86400000) % 86400000;
+  const h = day / 3600000;
+  const m = day / 60000 % 60;
+  const s = day / 1000 % 60;
+  return two(h) + ":" + two(m) + ":" + two(s) + "." + three(day % 1000);
+}
+
+// "3 ms", "-" when absent.
+export function millis(v: Option<int>): string {
+  return v.isSome() ? v.unwrap().toString() + " ms" : "-";
+}
+
+// Microseconds as milliseconds with two decimals: 1234 -> "1.23 ms".
+export function microsAsMs(us: int): string {
+  const whole = us / 1000;
+  const frac = us % 1000 / 10;
+  return whole.toString() + "." + two(frac) + " ms";
+}
+
+export function kib(bytes: Option<int>): string {
+  return bytes.isSome() ? (bytes.unwrap() / 1024).toString() + " KiB" : "-";
+}
+
+export function optInt(v: Option<int>): string {
+  return v.isSome() ? v.unwrap().toString() : "-";
+}
+
+// The first n bytes of s, with "..." when cut.
+export function clip(s: string, n: int): string {
+  if (s.length.toInt() <= n) {
+    return s;
+  }
+  return s.substring(0, n.toUsize()) + "...";
+}
+
+// Left-aligns s in a field of n spaces.
+export function padEnd(s: string, n: int): string {
+  let out = s;
+  while (out.length.toInt() < n) {
+    out += " ";
+  }
+  return out;
+}

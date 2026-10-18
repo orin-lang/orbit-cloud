@@ -1,0 +1,166 @@
+// orbit-console: the Orbit Cloud web console, an Orin application.
+//
+//   orbit-console --api http://127.0.0.1:8080 --api-token-file token --listen 127.0.0.1:8081
+//
+// It serves the console on orin-web and orin-ui, and talks to orbitd's /v1 API over std:net like any Orbit Cloud app would. See
+// README.md next to this file.
+import { Host, withProcess, withNet, withFs } from "std:host";
+import { args, exit } from "std:process";
+import { FsGrant, Read, readFile, withFile, fsErrorMessage } from "std:fs";
+import { fromString } from "std:bytes";
+import { hexEncode } from "std:encoding";
+import { Scope, TaskHandle, scopeNet, spawn, spawnNet, channel } from "std:task";
+import { NetGrant, netErrorMessage } from "std:net";
+import { ServerConfig, ServerHandle, defaultServerConfig, serve, textAsset } from "orin-web";
+import { Config, parseArgs, usage } from "./config";
+import { Target, NetCall, apiWorker, netApi } from "./transport";
+import { Command, hubLoop } from "./hub";
+import { Deps, buildApp } from "./app";
+import { program } from "./program";
+
+type Boot = { apiToken: string; consoleToken: string; js: string; css: string; entropy: string; };
+
+function slurp(fs: FsGrant, path: string): Result<string, string> {
+  const r = readFile(fs, path);
+  if (r.isErr()) {
+    return Err(fsErrorMessage(r.unwrapErr()));
+  }
+  return Ok(r.unwrap());
+}
+
+function tokenFrom(fs: FsGrant, literal: string, file: string): Result<string, string> {
+  if (literal.length > 0) {
+    return Ok(literal);
+  }
+  if (file.length > 0) {
+    return Ok(slurp(fs, file)?.trim());
+  }
+  return Ok("");
+}
+
+// 4096 random bytes from the operating system, as hex: the pool the hub draws login tokens from (see hub.or).
+function entropyPool(fs: FsGrant): string {
+  const r = withFile(
+    fs,
+    "/dev/urandom",
+    Read,
+    (f): string => {
+      const got = f.read(4096);
+      return got.isSome() ? got.unwrap() : "";
+    },
+  );
+  if (r.isErr()) {
+    return "";
+  }
+  return hexEncode(fromString(r.unwrap()));
+}
+
+function boot(fs: FsGrant, cfg: Config): Result<Boot, string> {
+  const apiToken = tokenFrom(fs, cfg.apiToken, cfg.apiTokenFile)?;
+  let consoleToken = tokenFrom(fs, cfg.consoleToken, cfg.consoleTokenFile)?;
+  if (consoleToken.length == 0) {
+    consoleToken = apiToken;
+  }
+  if (consoleToken.length == 0) {
+    return Err(
+      "the console needs a secret to sign in with: give --console-token(-file) or --api-token(-file)",
+    );
+  }
+  const js = slurp(fs, cfg.clientJs)?;
+  const css = slurp(fs, cfg.assetsDir + "/console.css")?;
+  const entropy = entropyPool(fs);
+  if (entropy.length == 0) {
+    return Err("cannot read /dev/urandom for login tokens");
+  }
+  return Ok(Boot {
+    apiToken: apiToken,
+    consoleToken: consoleToken,
+    js: js,
+    css: css,
+    entropy: entropy,
+  });
+}
+
+function run(net: NetGrant, cfg: Config, b: Boot): void {
+  const target = Target {
+    host: cfg.apiHost,
+    port: cfg.apiPort,
+    token: b.apiToken,
+    timeoutMs: 75000,
+  };
+  const serverConfig = ServerConfig {
+    ...defaultServerConfig(),
+    address: cfg.listenAddress,
+    port: cfg.listenPort,
+    workers: 16,
+    queue: 64,
+  };
+  scopeNet(
+    net,
+    (s: Scope, g: NetGrant): void => {
+      const calls = channel<NetCall>(64);
+      const cmds = channel<Command>(64);
+      const callsRx = calls.rx;
+      const cmdsRx = cmds.rx;
+      let apiTasks: TaskHandle<int>[] = [];
+      let i: int = 0;
+      while (i < cfg.workers) {
+        apiTasks.push(spawnNet(s, g, (wg: NetGrant): int => apiWorker(wg, target, callsRx)));
+        i += 1;
+      }
+      const hubTask = spawn(s, (): int => hubLoop(cmdsRx, b.entropy, program()));
+      const app = buildApp(Deps {
+        api: netApi(calls.tx),
+        hub: cmds.tx,
+        consoleToken: b.consoleToken,
+        assets: [textAsset("console.css", b.css), textAsset("orin-ui.js", b.js)],
+        accessLog: cfg.accessLog,
+      });
+      const done = serve(
+        g,
+        app,
+        serverConfig,
+        (h: ServerHandle): void => {
+          console.error(
+            "orbit-console listening on http://" + cfg.listenAddress + ":" + h.port.toString()
+                + ", orbitd at " + cfg.apiHost + ":" + cfg.apiPort.toString(),
+          );
+        },
+      );
+      if (done.isErr()) {
+        console.error("cannot serve: " + netErrorMessage(done.unwrapErr()));
+      }
+      calls.tx.close();
+      cmds.tx.close();
+      for (const t of apiTasks) {
+        t.join();
+      }
+      hubTask.join();
+    },
+  );
+}
+
+function main(host: Host): void {
+  const argv = withProcess(host, p => args(p));
+  const parsed = parseArgs(argv);
+  if (parsed.isErr()) {
+    console.error("orbit-console: " + parsed.unwrapErr());
+    console.error(usage());
+    exit(2);
+    return;
+  }
+  const cfg = parsed.unwrap();
+  const booted = withFs(host, (fs: FsGrant): Result<Boot, string> => boot(fs, cfg));
+  if (booted.isErr()) {
+    console.error("orbit-console: " + booted.unwrapErr());
+    exit(1);
+    return;
+  }
+  const b = booted.unwrap();
+  withNet(
+    host,
+    (net: NetGrant): void => {
+      run(net, cfg, b);
+    },
+  );
+}

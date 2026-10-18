@@ -1,0 +1,219 @@
+// What the console does against orbitd: loading screens and turning messages into API calls, against the fake.
+import { assert, assertEq, assertEqString } from "std:test";
+import { Api, ApiRequest, ApiResponse } from "../src/api";
+import {
+  Model, Msg, Page, initialModel, update, AppsPage, AppPage, RunsPage, RunPage, LogsPage,
+  QueuesPage, NoticePage, Refresh, RunNow, AskDelete, CancelDelete, ConfirmDelete, Activate, ShowKv,
+  HideKv, Redrive, ShowDead, HideDead, PublishForm, FilterForm, ToggleFollow, Noop,
+} from "../src/model";
+import {
+  Route, RouteApps, RouteApp, RouteRuns, RouteRun, RouteLogs, RouteQueues, loadPage, perform,
+  isNotFound, fetchLines,
+} from "../src/effects";
+import { fakeApi, downApi } from "./support";
+
+// Applies a user message the way the console does: the message, then what its effects found out.
+function step(api: Api, m: Model, msg: Msg): Model {
+  const results = perform(api, m, msg);
+  let next = update(m, msg);
+  for (const r of results) {
+    next = update(next, r);
+  }
+  return next;
+}
+
+function page(api: Api, route: Route): Model {
+  return initialModel(loadPage(api, route).unwrap());
+}
+
+function appOf(m: Model): string {
+  return match (m.page) {
+    AppPage(v) => v.detail.name,
+    _ => "",
+  };
+}
+
+@Test
+function everyRouteLoads(): void {
+  const api = fakeApi();
+  assert(loadPage(api, RouteApps).isOk(), "apps");
+  assert(loadPage(api, RouteApp("hello")).isOk(), "app");
+  assert(loadPage(api, RouteRuns).isOk(), "runs");
+  assert(loadPage(api, RouteRun("abc")).isOk(), "run");
+  assert(loadPage(api, RouteLogs).isOk(), "logs");
+  assert(loadPage(api, RouteQueues).isOk(), "queues");
+}
+
+@Test
+function failuresCarryTheirStatus(): void {
+  const api = fakeApi();
+  const gone = loadPage(api, RouteApp("nope"));
+  assert(gone.isErr() && isNotFound(gone.unwrapErr()), "a 404 is recognised");
+  const broken = loadPage(api, RouteApp("broken"));
+  assert(broken.isErr() && !isNotFound(broken.unwrapErr()), "a 500 is not a 404");
+  assert(broken.unwrapErr().includes("store failure"), "orbitd's message is kept");
+  assert(
+    loadPage(downApi(), RouteApps).unwrapErr().includes("connection refused"),
+    "network errors",
+  );
+}
+
+@Test
+function runNowShowsTheRunAndRefreshesThePage(): void {
+  const m = step(fakeApi(), page(fakeApi(), RouteApp("hello")), RunNow);
+  assertEqString(m.flash.text, "Run fresh succeeded, exit 0", "flash");
+  assertEqString(m.flash.href, "/runs/fresh", "link");
+  assert(!m.flash.bad, "good");
+  assertEqString(appOf(m), "hello", "still on the app");
+}
+
+@Test
+function runningAServiceIsReportedNotHidden(): void {
+  const m = step(fakeApi(), page(fakeApi(), RouteApp("svc")), RunNow);
+  assert(m.flash.bad, "bad flash");
+  assert(m.flash.text.includes("runs by itself"), "orbitd's reason: " + m.flash.text);
+}
+
+@Test
+function deletingAsksFirstThenGoesToANoticePage(): void {
+  const api = fakeApi();
+  let m = page(api, RouteApp("hello"));
+  m = step(api, m, AskDelete);
+  const asking = match (m.page) {
+    AppPage(v) => v.confirmDelete,
+    _ => false,
+  };
+  assert(asking, "asked");
+  assert(perform(api, m, AskDelete).length == 0, "asking calls nothing");
+  m = step(api, m, CancelDelete);
+  const cancelled = match (m.page) {
+    AppPage(v) => !v.confirmDelete,
+    _ => false,
+  };
+  assert(cancelled, "cancelled");
+  m = step(api, m, ConfirmDelete);
+  const gone = match (m.page) {
+    NoticePage(head, body, bad) => head == "Deleted hello" && !bad,
+    _ => false,
+  };
+  assert(gone, "deleted");
+}
+
+@Test
+function activatingADeploymentReloadsTheApp(): void {
+  const m = step(fakeApi(), page(fakeApi(), RouteApp("hello")), Activate(1));
+  assertEqString(m.flash.text, "Deployment 1 is active", "flash");
+  assertEqString(appOf(m), "hello", "reloaded");
+  const wrong = step(fakeApi(), page(fakeApi(), RouteApp("hello")), Activate(5));
+  assert(wrong.flash.bad, "orbitd refused: " + wrong.flash.text);
+}
+
+@Test
+function kvEntriesOpenAndClose(): void {
+  const api = fakeApi();
+  let m = page(api, RouteApp("hello"));
+  m = step(api, m, ShowKv("cfg"));
+  const entries = match (m.page) {
+    AppPage(v) => v.kv.isSome() ? v.kv.unwrap().entries.length.toInt() : -1,
+    _ => -1,
+  };
+  assertEq(entries, 2, "two entries");
+  m = step(api, m, HideKv);
+  const closed = match (m.page) {
+    AppPage(v) => v.kv.isNone(),
+    _ => false,
+  };
+  assert(closed, "closed");
+}
+
+@Test
+function deadLettersAndRedrive(): void {
+  const api = fakeApi();
+  let m = page(api, RouteQueues);
+  m = step(api, m, ShowDead("orders"));
+  const shown = match (m.page) {
+    QueuesPage(v) => v.dead.isSome() && v.dead.unwrap().letters.length == 1,
+    _ => false,
+  };
+  assert(shown, "one dead letter");
+  m = step(api, m, Redrive("orders"));
+  assertEqString(m.flash.text, "Redrove 1 dead letter(s) of orders", "flash");
+  const stillOpen = match (m.page) {
+    QueuesPage(v) => v.dead.isSome(),
+    _ => false,
+  };
+  assert(stillOpen, "the open dead letter list is refreshed, not closed");
+  m = step(api, m, HideDead);
+  const closed = match (m.page) {
+    QueuesPage(v) => v.dead.isNone(),
+    _ => false,
+  };
+  assert(closed, "closed");
+}
+
+@Test
+function publishingValidatesAndClearsTheForm(): void {
+  const api = fakeApi();
+  let m = page(api, RouteQueues);
+  const bad = step(api, m, PublishForm("queue=&body=hi"));
+  assert(bad.flash.bad && bad.flash.text.includes("name"), "needs a queue: " + bad.flash.text);
+  const keeps = match (bad.page) {
+    QueuesPage(v) => v.formBody == "hi",
+    _ => false,
+  };
+  assert(keeps, "the draft is kept when it fails");
+  m = step(api, m, PublishForm("queue=orders&body=%7B%7D"));
+  assertEqString(m.flash.text, "Queued message 42 on orders", "flash");
+  const cleared = match (m.page) {
+    QueuesPage(v) => v.formBody == "" && v.formQueue == "",
+    _ => false,
+  };
+  assert(cleared, "the form is empty again");
+  const generation = match (m.page) {
+    QueuesPage(v) => v.formGen,
+    _ => -1,
+  };
+  assertEq(generation, 1, "the form is a new element, so the browser's inputs are emptied");
+  const refused = step(api, m, PublishForm("queue=other&body=x"));
+  assert(refused.flash.bad, "orbitd's 404 for an unknown route is reported: " + refused.flash.text);
+}
+
+@Test
+function followingFetchesTheFirstLinesWithTheFilter(): void {
+  const api = fakeApi();
+  let m = page(api, RouteLogs);
+  m = step(api, m, ToggleFollow);
+  assert(m.logs.following, "following");
+  assertEq(m.logs.lines.length.toInt(), 3, "history");
+  assertEq(m.logs.lastId, 3, "cursor at the newest");
+  // while following, applying a filter starts over with the matching lines
+  m = step(api, m, FilterForm("app=hello&level=&contains="));
+  assertEq(m.logs.lines.length.toInt(), 3, "refetched with the filter");
+  // not following: a filter fetches nothing
+  const idle = step(api, page(api, RouteLogs), FilterForm("app=hello&level=&contains="));
+  assertEq(idle.logs.lines.length.toInt(), 0, "nothing until Follow");
+}
+
+@Test
+function pollingFetchesOnlyWhatIsNew(): void {
+  const api = fakeApi();
+  const all = fetchLines(api, initialModel(LogsPage).logs.filter, 0, 100).unwrap();
+  assertEq(all.length.toInt(), 1, "one LinesArrived message");
+  const none = fetchLines(api, initialModel(LogsPage).logs.filter, 3, 100).unwrap();
+  assertEq(none.length.toInt(), 0, "nothing after the newest line");
+  assert(
+    fetchLines(downApi(), initialModel(LogsPage).logs.filter, 0, 100).isErr(),
+    "errors are returned",
+  );
+}
+
+@Test
+function refreshRereadsTheCurrentPage(): void {
+  const api = fakeApi();
+  const m = step(api, page(api, RouteApp("hello")), Refresh);
+  assertEqString(appOf(m), "hello", "same page");
+  const down = step(downApi(), page(api, RouteApp("hello")), Refresh);
+  assert(down.flash.bad, "an outage is shown, the page stays");
+  assertEqString(appOf(down), "hello", "page kept");
+  assert(perform(api, initialModel(LogsPage), Noop).length == 0, "noop does nothing");
+}

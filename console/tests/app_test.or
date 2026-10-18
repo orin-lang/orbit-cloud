@@ -1,0 +1,391 @@
+// The console's routes through orin-web's TestClient, against a fake orbitd.
+import { assert, assertEq, assertEqString } from "std:test";
+import { TestClient, Response, assertStatus, assertHeader, readEvents } from "orin-web";
+import { withConsole, withConsoleOn, downApi, consoleToken, between } from "./support";
+import { cookieValue } from "../src/app";
+
+// Signs in with the token and returns a client that sends the login cookie.
+function signedIn(client: TestClient): TestClient {
+  const res = client.post("/login", "token=" + consoleToken());
+  assertStatus(res, 303);
+  const cookie = cookieValue(res.header("Set-Cookie").unwrapOr(""), "orbit_console");
+  assert(cookie.length == 32, "a 32 digit login id");
+  return client.withHeader("Cookie", "orbit_console=" + cookie);
+}
+
+function sessionOf(html: string): string {
+  return between(html, "data-ou-session=\"", "\"");
+}
+
+function eventBody(path: string, event: string, value: string): string {
+  return "{\"t\":\"event\",\"path\":" + path + ",\"event\":\"" + event + "\",\"value\":\"" + value
+      + "\"}";
+}
+
+@Test
+function openRoutesNeedNoSignIn(): void {
+  withConsole(client => {
+    assertEqString(client.get("/healthz").bodyText(), "ok", "health");
+    assertStatus(client.get("/login"), 200);
+    const css = client.get("/assets/console.css");
+    assertStatus(css, 200);
+    assertHeader(css, "Content-Type", "text/css; charset=utf-8");
+    assertStatus(client.get("/assets/orin-ui.js"), 200);
+  });
+}
+
+@Test
+function pagesRedirectToTheLoginForm(): void {
+  withConsole(client => {
+    for (const path of ["/", "/apps", "/apps/hello", "/runs", "/runs/abc", "/logs", "/queues"]) {
+      const res = client.get(path);
+      assertStatus(res, 303);
+      assertHeader(res, "Location", "/login");
+    }
+  });
+}
+
+@Test
+function otherMethodsGetA401(): void {
+  withConsole(client => {
+    const res = client.post("/ui/events", "{\"t\":\"join\"}");
+    assertStatus(res, 401);
+    assertStatus(client.post("/logout", ""), 401);
+    assertStatus(client.get("/ui/stream?s=s0"), 303);
+  });
+}
+
+@Test
+function aWrongTokenIsRefused(): void {
+  withConsole(client => {
+    const res = client.post("/login", "token=nope");
+    assertStatus(res, 401);
+    assert(res.bodyText().includes("not right"), "says so");
+    assert(res.header("Set-Cookie").isNone(), "no cookie");
+    assertStatus(client.get("/?token=nope"), 303);
+    assertHeader(client.get("/?token=nope"), "Location", "/login");
+  });
+}
+
+@Test
+function loginSetsAHardenedCookieAndLogoutRevokesIt(): void {
+  withConsole(client => {
+    const res = client.post("/login", "token=" + consoleToken());
+    assertStatus(res, 303);
+    assertHeader(res, "Location", "/");
+    const set = res.header("Set-Cookie").unwrapOr("");
+    assert(set.includes("HttpOnly"), "HttpOnly");
+    assert(set.includes("SameSite=Strict"), "SameSite");
+    assert(set.includes("Path=/"), "path");
+    const me = signedIn(client);
+    assertStatus(me.get("/"), 200);
+    const out = me.post("/logout", "");
+    assertStatus(out, 303);
+    assert(out.header("Set-Cookie").unwrapOr("").includes("Max-Age=0"), "cookie cleared");
+    assertStatus(me.get("/"), 303);
+  });
+}
+
+@Test
+function aBearerTokenAndAQueryTokenAlsoSignIn(): void {
+  withConsole(client => {
+    const bearer = client.withHeader("Authorization", "Bearer " + consoleToken());
+    assertStatus(bearer.get("/runs"), 200);
+    assertStatus(client.withHeader("Authorization", "Bearer wrong").post("/ui/events", "{}"), 401);
+    const q = client.get("/runs?token=" + consoleToken());
+    assertStatus(q, 303);
+    assertHeader(q, "Location", "/runs");
+    assert(q.header("Set-Cookie").unwrapOr("").startsWith("orbit_console="), "cookie issued");
+    // a token in the query does not authorise a POST
+    assertStatus(client.post("/ui/events?token=" + consoleToken(), "{}"), 401);
+  });
+}
+
+@Test
+function theAppsPageListsTheApps(): void {
+  withConsole(client => {
+    const res = signedIn(client).get("/");
+    assertStatus(res, 200);
+    assertHeader(res, "Content-Type", "text/html; charset=utf-8");
+    assertHeader(res, "Cache-Control", "no-store");
+    const html = res.bodyText();
+    assert(html.includes("<title>Apps - Orbit Cloud</title>"), "title");
+    assert(html.includes("<a href=\"/apps/hello\">hello</a>"), "link to the app");
+    assert(html.includes("<td>consumer</td>"), "kind");
+    assert(html.includes("running"), "worker state");
+    assert(html.includes("2026-10-18"), "created date");
+    assert(html.includes("data-orin-ui=\"/ui/events\""), "mount element");
+    assert(html.includes("data-ou-seq=\"0\""), "sequence start");
+    assert(html.includes("/assets/orin-ui.js"), "client script");
+    assert(!html.includes("data-ou-stream"), "no stream on the apps page");
+    assert(html.includes("<a href=\"/\" class=\"on\">Apps</a>"), "navigation marks the page");
+  });
+}
+
+@Test
+function anAppPageShowsDeploymentsRunsAndKv(): void {
+  withConsole(client => {
+    const res = signedIn(client).get("/apps/hello");
+    assertStatus(res, 200);
+    const html = res.bodyText();
+    assert(html.includes("<h2>hello</h2>"), "name");
+    assert(html.includes("2 (active)"), "active deployment marked");
+    assert(html.includes("0fbd9e9e1e65..."), "module prefix");
+    assert(html.includes("Run now"), "run button");
+    assert(html.includes("Delete app"), "delete button");
+    assert(html.includes("Activate"), "activate button for the inactive deployment");
+    assert(html.includes("/runs/abc"), "run link");
+    assert(html.includes("cfg (2)"), "kv namespace button");
+  });
+}
+
+@Test
+function aServiceHasNoRunButton(): void {
+  withConsole(client => {
+    const html = signedIn(client).get("/apps/svc").bodyText();
+    assert(!html.includes("Run now"), "no run now for a service");
+    assert(html.includes("worker running deployment 9"), "worker line");
+  });
+}
+
+@Test
+function aRunPageShowsTheTraceWaterfallAndLogs(): void {
+  withConsole(client => {
+    const res = signedIn(client).get("/runs/abc");
+    assertStatus(res, 200);
+    const html = res.bodyText();
+    assert(html.includes("succeeded"), "status");
+    assert(html.includes("peak memory 1792 KiB"), "memory");
+    assert(
+      html.includes("<td class=\"child\">execute</td>")
+          && html.includes("<td class=\"root\">run</td>"),
+      "span rows",
+    );
+    assert(html.includes("class=\"bar\""), "timeline bars");
+    assert(html.includes("left:0.0%;width:100.0%"), "the root span covers the whole trace");
+    assert(html.includes("line 1") && html.includes("line 2"), "log lines");
+  });
+}
+
+@Test
+function theRunsPageListsRecentRuns(): void {
+  withConsole(client => {
+    const html = signedIn(client).get("/runs").bodyText();
+    assert(html.includes("Recent runs"), "heading");
+    assert(html.includes("<td class=\"bad\">failed</td>"), "a failed run is marked");
+    assert(html.includes("546 ms"), "wall time");
+  });
+}
+
+@Test
+function theQueuesPageShowsCountsAndTheForm(): void {
+  withConsole(client => {
+    const html = signedIn(client).get("/queues").bodyText();
+    assert(html.includes("<td>orders</td>"), "queue");
+    assert(
+      html.includes("Dead letters") && html.includes("Redrive"),
+      "dead letter controls only where there are dead letters",
+    );
+    assert(html.includes("name=\"queue\"") && html.includes("name=\"body\""), "publish form");
+  });
+}
+
+@Test
+function theLogsPageOpensTheStream(): void {
+  withConsole(client => {
+    const html = signedIn(client).get("/logs").bodyText();
+    assert(html.includes("data-ou-stream=\"/ui/stream\""), "stream attribute");
+    assert(html.includes("Follow"), "follow button");
+    assert(html.includes("name=\"level\""), "level filter");
+  });
+}
+
+@Test
+function missingThingsAre404AndApiFailuresAre502(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const gone = me.get("/apps/nope");
+    assertStatus(gone, 404);
+    assert(gone.bodyText().includes("Not found"), "says so");
+    assertStatus(me.get("/apps/broken"), 502);
+    assertStatus(me.get("/no/such/page"), 404);
+  });
+  withConsoleOn(
+    downApi(),
+    client => {
+      const res = signedIn(client).get("/");
+      assertStatus(res, 502);
+      assert(res.bodyText().includes("cannot reach orbitd"), "network failure shown");
+    },
+  );
+}
+
+@Test
+function hostileNamesAreEscaped(): void {
+  withConsole(client => {
+    const html = signedIn(client).get("/apps/evil").bodyText();
+    assert(!html.includes("<img src=x"), "no raw element from a name");
+    assert(!html.includes("<script>alert"), "no raw script element");
+    assert(html.includes("&lt;img src=x onerror=alert(1)&gt;"), "the name is shown as text");
+  });
+}
+
+@Test
+function eventsRunNowAndPatchThePage(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const sid = sessionOf(me.get("/apps/hello").bodyText());
+    const run = me
+        .withHeader("X-Orin-UI-Session", sid)
+        .post("/ui/events", eventBody("[0,1,1,0]", "click", ""));
+    assertStatus(run, 200);
+    assertHeader(run, "Content-Type", "application/json");
+    const body = run.bodyText();
+    assert(body.startsWith("{\"t\":\"patch\",\"n\":0,"), "a numbered patch: " + body);
+    assert(body.includes("Run fresh succeeded, exit 0"), "the flash");
+    assert(body.includes("/runs/fresh"), "link to the run");
+    // a second event gets the next number
+    const again = me
+        .withHeader("X-Orin-UI-Session", sid)
+        .post("/ui/events", eventBody("[0,1,1,1]", "click", ""));
+    assert(again.bodyText().startsWith("{\"t\":\"patch\",\"n\":1,"), "n counts up");
+  });
+}
+
+@Test
+function eventsActivateADeploymentAndConfirmDelete(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const sid = sessionOf(me.get("/apps/hello").bodyText());
+    const ui = me.withHeader("X-Orin-UI-Session", sid);
+    // the Delete button asks first
+    const ask = ui.post("/ui/events", eventBody("[0,1,1,2]", "click", ""));
+    assert(ask.bodyText().includes("Yes, delete"), "confirmation: " + ask.bodyText());
+    // the confirm button is the first child of the confirm span (path ends [..,2,2])
+    const del = ui.post("/ui/events", eventBody("[0,1,1,2,1]", "click", ""));
+    assert(del.bodyText().includes("Deleted hello"), "gone: " + del.bodyText());
+  });
+}
+
+@Test
+function aKvNamespaceOpensInPlace(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const sid = sessionOf(me.get("/apps/hello").bodyText());
+    // children of the page div: h2, row, p, h2, table, h2, runs table, h2, namespaces row
+    const kv = me
+        .withHeader("X-Orin-UI-Session", sid)
+        .post("/ui/events", eventBody("[0,1,8,0]", "click", ""));
+    const body = kv.bodyText();
+    assert(body.includes("blue"), "the entries: " + body);
+    assert(body.includes("&lt;b&gt;") == false, "the patch is JSON, not HTML");
+    assert(!body.includes("<script>"), "values are never markup");
+  });
+}
+
+@Test
+function publishingToAQueueGoesThroughTheForm(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const sid = sessionOf(me.get("/queues").bodyText());
+    const ui = me.withHeader("X-Orin-UI-Session", sid);
+    const sent = ui.post(
+      "/ui/events",
+      eventBody("[0,1,3]", "submit", "queue=orders&body=%7B%22id%22%3A1%7D"),
+    );
+    assert(sent.bodyText().includes("Queued message 42 on orders"), "flash: " + sent.bodyText());
+    const empty = ui.post("/ui/events", eventBody("[0,1,3]", "submit", "queue=&body=x"));
+    assert(empty.bodyText().includes("Give the queue a name"), "validation: " + empty.bodyText());
+  });
+}
+
+@Test
+function eventsFromAnUnknownSessionAskForAReload(): void {
+  withConsole(client => {
+    const me = signedIn(client).withHeader("X-Orin-UI-Session", "s999");
+    const res = me.post("/ui/events", eventBody("[0]", "click", ""));
+    assertStatus(res, 200);
+    assert(res.bodyText().startsWith("{\"t\":\"mount\""), "a mount with a notice");
+    assert(res.bodyText().includes("out of date"), "tells the user to reload");
+    assert(
+      me.post("/ui/events", "{\"t\":\"join\"}").bodyText().includes("out of date"),
+      "join too",
+    );
+  });
+}
+
+@Test
+function malformedEventsAreBadRequests(): void {
+  withConsole(client => {
+    const me = signedIn(client).withHeader("X-Orin-UI-Session", "s0");
+    assertStatus(me.post("/ui/events", "not json"), 400);
+    assertStatus(me.post("/ui/events", "{\"t\":\"nonsense\"}"), 400);
+  });
+}
+
+@Test
+function anEventAtAPathWithoutAHandlerChangesNothing(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const sid = sessionOf(me.get("/apps/hello").bodyText());
+    const res = me
+        .withHeader("X-Orin-UI-Session", sid)
+        .post("/ui/events", eventBody("[0,0]", "click", ""));
+    assertEqString(res.bodyText(), "{\"t\":\"patch\",\"ops\":[]}", "empty patch");
+  });
+}
+
+@Test
+function joinSendsTheWholeScreenNumbered(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const sid = sessionOf(me.get("/queues").bodyText());
+    const res = me.withHeader("X-Orin-UI-Session", sid).post("/ui/events", "{\"t\":\"join\"}");
+    const body = res.bodyText();
+    assert(body.startsWith("{\"t\":\"mount\",\"n\":0,\"dom\":["), "mount: " + body);
+    assert(body.includes("Queues"), "has the screen");
+  });
+}
+
+@Test
+function theStreamPushesNewLogLinesAsPatches(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const sid = sessionOf(me.get("/logs").bodyText());
+    const ui = me.withHeader("X-Orin-UI-Session", sid);
+    // not following yet: the stream only says when to come back
+    const idle = readEvents(ui.get("/ui/stream?s=" + sid), 4);
+    assertEq(idle.length.toInt(), 1, "one event");
+    assertEqString(idle[0].data, "", "no data");
+    assertEq(idle[0].retry.unwrapOr(0), 1500, "slow poll while not following");
+    // Follow: the first lines come in the reply
+    const follow = ui.post("/ui/events", eventBody("[0,1,1,4]", "click", ""));
+    assert(follow.bodyText().includes("line 3"), "history: " + follow.bodyText());
+    // nothing new: only the retry
+    const quiet = readEvents(ui.get("/ui/stream?s=" + sid), 4);
+    assertEq(quiet.length.toInt(), 1, "no new lines, no patch");
+    assertEq(quiet[0].retry.unwrapOr(0), 500, "fast poll while following");
+  });
+}
+
+@Test
+function theStreamOfAnUnknownSessionIsA404(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    assertStatus(me.get("/ui/stream?s=s77"), 404);
+    assertStatus(me.get("/ui/stream"), 404);
+  });
+}
+
+@Test
+function cookiesAreParsedByName(): void {
+  assertEqString(cookieValue("a=1; orbit_console=xyz; b=2", "orbit_console"), "xyz", "middle");
+  assertEqString(cookieValue("orbit_console=xyz", "orbit_console"), "xyz", "only");
+  assertEqString(cookieValue("a=1", "orbit_console"), "", "absent");
+  assertEqString(cookieValue("", "orbit_console"), "", "empty");
+  assertEqString(
+    cookieValue("xorbit_console=1", "orbit_console"),
+    "",
+    "a longer name does not match",
+  );
+}

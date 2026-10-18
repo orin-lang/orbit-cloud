@@ -1,0 +1,234 @@
+// The views as orin-ui sees them: rendered HTML, the tree's event handlers, and the patches a change produces.
+import { assert, assertEq, assertEqString } from "std:test";
+import {
+  Dom, Session, Step, Patch, Create, Remove, Replace, SetAttr, RemoveAttr, SetText, Move, sessionOf,
+  start, send, renderHtml, messageAt, handleEvent, ClientEvent, apply,
+} from "orin-ui";
+import { AppSummary, LogLine, Run, Span } from "../src/types";
+import {
+  Model, Msg, initialModel, AppsPage, RunsPage, LogsPage, NoticePage, LinesArrived, ToggleFollow,
+  Notice, goodFlash, AskDelete, RunNow, Activate, ShowKv, Redrive, ShowDead, PublishForm,
+  FilterForm, ClearLines, Show, QueuesPage, QueuesView,
+} from "../src/model";
+import { Route, RouteApp, RouteQueues, RouteRun, RouteApps, loadPage } from "../src/effects";
+import { program } from "../src/program";
+import { fakeApi } from "./support";
+
+function render(m: Model): string {
+  return renderHtml(sessionOf<Model, Msg>(program(), m).dom);
+}
+
+function modelOf(route: Route): Model {
+  return initialModel(loadPage(fakeApi(), route).unwrap());
+}
+
+function msgAt(m: Model, path: int[], event: string, value: string): Option<Msg> {
+  return messageAt<Msg>(sessionOf<Model, Msg>(program(), m).tree, path, event, value);
+}
+
+function isRunNow(o: Option<Msg>): bool {
+  return o.isSome()
+      && match (o.unwrap()) {
+        RunNow => true,
+        _ => false,
+      };
+}
+
+function line(id: int): LogLine {
+  return LogLine {
+    id: id,
+    app: "a",
+    level: "info",
+    message: "m" + id.toString(),
+    ts: 1792336580000,
+    runId: "",
+  };
+}
+
+@Test
+function anEmptyAppListSaysHowToDeploy(): void {
+  const html = render(initialModel(AppsPage([])));
+  assert(html.includes("No apps yet"), "empty state");
+  assert(html.includes("occtl deploy"), "hint");
+  assert(!html.includes("<table"), "no table");
+}
+
+@Test
+function textFromTheApiIsNeverMarkup(): void {
+  const evil = AppSummary {
+    name: "<script>alert(1)</script>",
+    kind: "job\"><b>",
+    version: 1,
+    workerRunning: false,
+    createdAt: 0,
+  };
+  const html = render(initialModel(AppsPage([evil])));
+  assert(!html.includes("<script"), "no script element");
+  assert(!html.includes("<b>"), "no injected element");
+  assert(html.includes("&lt;script&gt;alert(1)&lt;/script&gt;"), "escaped text");
+  // and a link built from the name stays inside the attribute
+  assert(
+    html.includes("href=\"/apps/%3Cscript%3Ealert%281%29%3C%2Fscript%3E\""),
+    "link is percent-encoded: " + html,
+  );
+}
+
+@Test
+function tablesUseTheStructureABrowserKeeps(): void {
+  // a <tr> directly inside <table> would get a <tbody> from the HTML parser and the paths of the patch stream would
+  // no longer match the DOM
+  for (const html of [
+    render(modelOf(RouteApps)),
+    render(modelOf(RouteApp("hello"))),
+    render(modelOf(RouteRun("abc"))),
+    render(modelOf(RouteQueues)),
+  ]) {
+    assert(!html.includes("<table><tr"), "no tr straight in table");
+    assert(html.includes("<thead>") && html.includes("<tbody>"), "thead and tbody");
+  }
+}
+
+@Test
+function buttonsMapToTheirMessages(): void {
+  const m = modelOf(RouteApp("hello"));
+  assert(isRunNow(msgAt(m, [0, 1, 1, 0], "click", "")), "Run now");
+  assert(msgAt(m, [0, 1, 1, 0], "dblclick", "").isNone(), "only click is handled");
+  assert(msgAt(m, [0, 1, 1], "click", "").isNone(), "the row itself handles nothing");
+}
+
+@Test
+function formsSendTheirFieldsAsTheMessagePayload(): void {
+  const q = msgAt(modelOf(RouteQueues), [0, 1, 3], "submit", "queue=orders&body=x");
+  assert(q.isSome(), "publish form");
+  const text = match (q.unwrap()) {
+    PublishForm(v) => v,
+    _ => "",
+  };
+  assertEqString(text, "queue=orders&body=x", "the payload");
+  const f = msgAt(initialModel(LogsPage), [0, 1, 1], "submit", "app=a");
+  assert(
+    f.isSome()
+        && match (f.unwrap()) {
+          FilterForm(v) => v == "app=a",
+          _ => false,
+        },
+    "filter form",
+  );
+}
+
+@Test
+function theDeleteButtonTurnsIntoAConfirmation(): void {
+  const m = modelOf(RouteApp("hello"));
+  assert(render(m).includes("Delete app"), "asks");
+  const next = send<Model, Msg>(program(), sessionOf<Model, Msg>(program(), m), AskDelete);
+  const html = renderHtml(next.session.dom);
+  assert(html.includes("Yes, delete") && html.includes("Cancel"), "confirmation");
+  assert(!html.includes(">Delete app<"), "the plain button is gone");
+}
+
+@Test
+function theWaterfallPlacesSpansOnATimeline(): void {
+  const html = render(modelOf(RouteRun("abc")));
+  // root 1000000..1546000, load 1000000..1100000, execute 1100000..1546000: parts per thousand of 546000
+  assert(html.includes("left:0.0%;width:100.0%"), "root");
+  assert(html.includes("left:0.0%;width:18.3%"), "load: 100000 / 546000");
+  assert(html.includes("left:18.3%;width:81.6%"), "execute starts where load ends");
+  assert(html.includes("546.00 ms"), "root duration");
+  assert(html.includes("&quot;bytes&quot;:102298"), "attributes are in the hover text");
+}
+
+@Test
+function aNewLogLineIsOnePatchNotARerender(): void {
+  const p = program();
+  let m = initialModel(LogsPage);
+  m = update2(m, ToggleFollow);
+  m = update2(m, LinesArrived([line(1), line(2), line(3)]));
+  const before = sessionOf<Model, Msg>(p, m);
+  const step = send<Model, Msg>(p, before, LinesArrived([line(4)]));
+  assertEq(step.patches.length.toInt(), 1, "one patch");
+  const created = match (step.patches[0]) {
+    Create(path, node) => path.length == 4 && path[3] == 0,
+    _ => false,
+  };
+  assert(created, "a new first child: the newest line is first in the DOM");
+  // and the patch really brings the old screen to the new one
+  assertEqString(
+    renderHtml(apply(before.dom, step.patches).unwrap()),
+    renderHtml(step.session.dom),
+    "apply(old, patches) == new",
+  );
+}
+
+@Test
+function liveLinesAreNewestFirstForTheReversedBox(): void {
+  let m = update2(initialModel(LogsPage), ToggleFollow);
+  m = update2(m, LinesArrived([line(1), line(2)]));
+  const html = render(m);
+  assert(html.includes("class=\"logs live\""), "the live box");
+  const at1 = html.indexOf("m1").unwrap();
+  const at2 = html.indexOf("m2").unwrap();
+  assert(at2 < at1, "the newest line comes first in the markup");
+}
+
+@Test
+function clearingTheLogEmptiesTheBox(): void {
+  let m = update2(initialModel(LogsPage), ToggleFollow);
+  m = update2(m, LinesArrived([line(1)]));
+  m = update2(m, ClearLines);
+  assert(!render(m).includes("m1"), "gone");
+  assert(render(m).includes("class=\"logs live\""), "still following, so the box stays");
+}
+
+@Test
+function theFlashAppearsAndKeepsItsPlace(): void {
+  const p = program();
+  const m = modelOf(RouteApp("hello"));
+  const before = sessionOf<Model, Msg>(p, m);
+  assert(renderHtml(before.dom).includes("class=\"flash hidden\""), "hidden at first");
+  const step = send<Model, Msg>(p, before, Notice(goodFlash("saved", "/runs/x")));
+  const html = renderHtml(step.session.dom);
+  assert(
+    html.includes("<div class=\"flash\"><span>saved</span><a href=\"/runs/x\">open</a></div>"),
+    "shown: " + html,
+  );
+  assertEqString(renderHtml(apply(before.dom, step.patches).unwrap()), html, "patches match");
+}
+
+@Test
+function theNoticePageLinksBack(): void {
+  const html = render(initialModel(NoticePage("Deleted x", "gone", false)));
+  assert(html.includes("<h2>Deleted x</h2>") && html.includes("href=\"/\""), "title and link");
+}
+
+function update2(m: Model, msg: Msg): Model {
+  return send<Model, Msg>(program(), sessionOf<Model, Msg>(program(), m), msg).session.model;
+}
+
+@Test
+function aNewFormGenerationReplacesTheFormSoTheBrowserEmptiesIt(): void {
+  const p = program();
+  const m = modelOf(RouteQueues);
+  const view = match (m.page) {
+    QueuesPage(v) => v,
+    _ => QueuesView { queues: [], dead: None, formQueue: "", formBody: "", formGen: 0 },
+  };
+  const before = sessionOf<Model, Msg>(p, m);
+  const step = send<Model, Msg>(
+    p,
+    before,
+    Show(QueuesPage(QueuesView { ...view, formGen: view.formGen + 1 })),
+  );
+  assertEq(step.patches.length.toInt(), 2, "the old form goes and a new one comes");
+  const removed = match (step.patches[0]) {
+    Remove(path) => path.length == 3,
+    _ => false,
+  };
+  const created = match (step.patches[1]) {
+    Create(path, node) => path.length == 3,
+    _ => false,
+  };
+  assert(removed && created, "the form element is replaced, not patched");
+  // with the same generation and the same data nothing changes on screen
+  const same = send<Model, Msg>(p, before, Show(QueuesPage(view)));
+  assertEq(same.patches.length.toInt(), 0, "no patches");
+}

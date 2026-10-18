@@ -1,0 +1,166 @@
+// The real Api: HTTP/1.1 over std:net, written on std:http's message layer.
+//
+// A request handler is a closure and cannot capture a NetGrant (E0452), so the sockets live in a small pool of worker tasks that
+// each hold a grant narrowed to orbitd's address and port (`useConnect`). A handler sends the worker a `NetCall` through a
+// channel and waits for the answer on a one-shot channel; `netApi` wraps that round trip as an `Api` function.
+import { Sender, Receiver, channel } from "std:task";
+import { Bytes, fromString } from "std:bytes";
+import { milliseconds } from "std:time";
+import {
+  Headers, tryHeaders, emptyHeaders, Request, RequestParts, Get, Post, Put, Delete, Ext, Http11,
+  ResponseParser, ToOther, NeedMore, Done, Failed, HttpLimits, defaultLimits, serializeRequest,
+  httpErrorMessage, Method,
+} from "std:http";
+import {
+  NetGrant, Stream, withConnect, withConnection, sendAll, recv, netErrorMessage,
+} from "std:net";
+import { Api, ApiRequest, ApiResponse } from "./api";
+
+// Where orbitd listens and how to talk to it. `token` is sent as a bearer token (empty: no Authorization field).
+export type Target = { host: string; port: int; token: string; timeoutMs: int; };
+
+export type NetCall = { req: ApiRequest; reply: Sender<Result<ApiResponse, string>>; };
+
+function limits(): HttpLimits {
+  return HttpLimits { ...defaultLimits(), maxBody: 8388608 };
+}
+
+function methodOf(name: string): Method {
+  return match (name) {
+    "GET" => Get,
+    "POST" => Post,
+    "PUT" => Put,
+    "DELETE" => Delete,
+    _ => Ext(name),
+  };
+}
+
+function encodeRequest(t: Target, req: ApiRequest): Result<Bytes, string> {
+  let names: string[] = ["Host", "Connection", "Accept"];
+  let values: string[] = [t.host + ":" + t.port.toString(), "close", "application/json"];
+  if (t.token.length > 0) {
+    names.push("Authorization");
+    values.push("Bearer " + t.token);
+  }
+  const body = fromString(req.body);
+  if (req.method != "GET" && req.method != "HEAD") {
+    names.push("Content-Length");
+    values.push(body.length().toString());
+  }
+  const headers = tryHeaders(names, values);
+  if (headers.isErr()) {
+    return Err("the API token cannot be sent as a header field");
+  }
+  const parts = RequestParts {
+    method: methodOf(req.method),
+    target: req.path,
+    version: Http11,
+    headers: headers.unwrap(),
+    body: body,
+    trailers: emptyHeaders(),
+  };
+  const r = Request.tryNew(parts);
+  if (r.isErr()) {
+    return Err("cannot build the request: " + httpErrorMessage(r.unwrapErr()));
+  }
+  return Ok(serializeRequest(r.unwrap()));
+}
+
+// Sends the request on the connection and reads the whole answer (the connection is closed after it).
+function exchange(s: Stream, t: Target, wire: Bytes): Result<ApiResponse, string> {
+  const timeout = milliseconds(t.timeoutMs);
+  const sent = sendAll(s, wire, timeout);
+  if (sent.isErr()) {
+    return Err("cannot send to orbitd: " + netErrorMessage(sent.unwrapErr()));
+  }
+  let parser = new ResponseParser(limits(), ToOther);
+  while (true) {
+    const got = recv(s, 16384, timeout);
+    if (got.isErr()) {
+      const eof = parser.atEof();
+      match (eof) {
+        Done(res, used) => {
+          return Ok(ApiResponse { status: res.status().code(), body: res.body().toRawString() });
+        },
+        _ => {
+          return Err("orbitd closed the connection: " + netErrorMessage(got.unwrapErr()));
+        },
+      }
+    }
+    const step = parser.feed(got.unwrap());
+    match (step) {
+      NeedMore => {},
+      Done(res, used) => {
+        return Ok(ApiResponse { status: res.status().code(), body: res.body().toRawString() });
+      },
+      Failed(e) => {
+        return Err("orbitd sent a malformed answer: " + httpErrorMessage(e));
+      },
+    }
+  }
+  return Err("unreachable");
+}
+
+// One HTTP exchange with orbitd. `net` is narrowed to the target first, so this function can reach nothing else.
+export function httpCall(net: NetGrant, t: Target, req: ApiRequest): Result<ApiResponse, string> {
+  const wire = encodeRequest(t, req)?;
+  return withConnect(
+    net,
+    t.host,
+    t.port,
+    t.port,
+    (c: NetGrant): Result<ApiResponse, string> => {
+      const r = withConnection(
+        c,
+        t.host,
+        t.port,
+        milliseconds(t.timeoutMs),
+        (s: Stream): Result<ApiResponse, string> => exchange(s, t, wire),
+      );
+      if (r.isErr()) {
+        return Err(
+          "cannot reach orbitd at " + t.host + ":" + t.port.toString() + ": "
+              + netErrorMessage(r.unwrapErr()),
+        );
+      }
+      return r.unwrap();
+    },
+  );
+}
+
+// The body of an API worker task: serves calls until the channel is closed and drained. Returns how many it served.
+export function apiWorker(net: NetGrant, t: Target, calls: Receiver<NetCall>): int {
+  let served: int = 0;
+  let going = true;
+  while (going) {
+    const next = calls.recv();
+    match (next) {
+      Some(c) => {
+        c.reply.send(httpCall(net, t, c.req));
+        served += 1;
+      },
+      None => {
+        going = false;
+      },
+    }
+  }
+  return served;
+}
+
+// An Api that sends each request to the worker pool and waits for its answer.
+export function netApi(calls: Sender<NetCall>): Api {
+  return (req: ApiRequest): Result<ApiResponse, string> => {
+    const reply = channel<Result<ApiResponse, string>>(1);
+    const sent = calls.send(NetCall { req: req, reply: reply.tx });
+    if (sent.isErr()) {
+      return Err("the console is shutting down");
+    }
+    const got = reply.rx.recv();
+    reply.rx.close();
+    reply.tx.close();
+    if (got.isNone()) {
+      return Err("the API worker stopped");
+    }
+    return got.unwrap();
+  };
+}

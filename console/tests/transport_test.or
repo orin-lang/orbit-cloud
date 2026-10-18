@@ -1,0 +1,237 @@
+// The HTTP client over real loopback sockets, against a small orin-web server that plays orbitd.
+import { assert, assertEq, assertEqString } from "std:test";
+import { Host, withNet } from "std:host";
+import { Scope, scopeNet, spawnNet, channel } from "std:task";
+import { NetGrant } from "std:net";
+import { Bytes, fromString } from "std:bytes";
+import {
+  Router, Request, Response, WebError, ServerConfig, ServerHandle, defaultServerConfig, serve,
+  bearerToken, notFound,
+} from "orin-web";
+import { ApiRequest, ApiResponse, listApps, publish } from "../src/api";
+import { Target, NetCall, httpCall, apiWorker, netApi } from "../src/transport";
+
+function fakeOrbitd(): Router {
+  let app = new Router();
+  let v1 = new Router();
+  v1.use(bearerToken("secret", "operator"));
+  v1.get(
+    "/apps",
+    (req: Request): Result<Response, WebError> => Ok(
+      Response.text(200, "[]").withContentType("application/json"),
+    ),
+  );
+  v1.post(
+    "/queues/:q/messages",
+    (req: Request): Result<Response, WebError> => Ok(
+      Response
+          .text(
+            201,
+            "{\"id\":" + req.body().length().toString() + ",\"queue\":\""
+                + req.param("q").unwrapOr("") + "\"}",
+          )
+          .withContentType("application/json"),
+    ),
+  );
+  v1.delete("/apps/:name", (req: Request): Result<Response, WebError> => Ok(Response.empty(204)));
+  v1.get(
+    "/big",
+    (req: Request): Result<Response, WebError> => {
+      // a chunked body in three pieces
+      const ch = channel<Bytes>(4);
+      ch.tx.send(fromString("[\"a"));
+      ch.tx.send(fromString("bc\","));
+      ch.tx.send(fromString("\"d\"]"));
+      ch.tx.close();
+      const rx = ch.rx;
+      return Ok(Response.stream(200, "application/json", () => rx.recv()));
+    },
+  );
+  v1.get("/nothing", (req: Request): Result<Response, WebError> => Err(notFound("nothing here")));
+  app.mount("/v1", v1);
+  return app;
+}
+
+function withOrbitd<T>(host: Host, client: (g: NetGrant, port: int) => T): T {
+  return withNet(
+    host,
+    net => {
+      return scopeNet(
+        net,
+        (s: Scope, g: NetGrant): T => {
+          const ch = channel<ServerHandle>(1);
+          const tx = ch.tx;
+          const cfg = ServerConfig { ...defaultServerConfig(), port: 0, workers: 4, queue: 8 };
+          const app = fakeOrbitd();
+          const server = spawnNet(
+            s,
+            g,
+            (sg: NetGrant) => serve(
+              sg,
+              app,
+              cfg,
+              (h: ServerHandle) => {
+                tx.send(h);
+              },
+            ),
+          );
+          const handle = ch.rx.recv().unwrap();
+          const result = client(g, handle.port);
+          handle.stop.cancel();
+          server.join();
+          return result;
+        },
+      );
+    },
+  );
+}
+
+function target(port: int, token: string): Target {
+  return Target { host: "127.0.0.1", port: port, token: token, timeoutMs: 3000 };
+}
+
+@Test
+function getsWithTheBearerToken(host: Host): void {
+  const out = withOrbitd(
+    host,
+    (g: NetGrant, port: int): string[] => {
+      const ok = httpCall(
+        g,
+        target(port, "secret"),
+        ApiRequest { method: "GET", path: "/v1/apps", body: "" },
+      );
+      const denied = httpCall(
+        g,
+        target(port, "wrong"),
+        ApiRequest { method: "GET", path: "/v1/apps", body: "" },
+      );
+      const none = httpCall(
+        g,
+        target(port, ""),
+        ApiRequest { method: "GET", path: "/v1/apps", body: "" },
+      );
+      return [
+        ok.unwrap().status.toString() + ok.unwrap().body,
+        denied.unwrap().status.toString(),
+        none.unwrap().status.toString(),
+      ];
+    },
+  );
+  assertEqString(out[0], "200[]", "authorised");
+  assertEqString(out[1], "401", "wrong token");
+  assertEqString(out[2], "401", "no token");
+}
+
+@Test
+function postsABodyWithItsLength(host: Host): void {
+  const out = withOrbitd(
+    host,
+    (g: NetGrant, port: int): ApiResponse => {
+      return httpCall(
+        g,
+        target(port, "secret"),
+        ApiRequest { method: "POST", path: "/v1/queues/orders/messages", body: "{\"id\":1}" },
+      ).unwrap();
+    },
+  );
+  assertEq(out.status, 201, "created");
+  assertEqString(out.body, "{\"id\":8,\"queue\":\"orders\"}", "the server saw 8 body bytes");
+}
+
+@Test
+function readsNoContentChunkedAndErrorAnswers(host: Host): void {
+  const out = withOrbitd(
+    host,
+    (g: NetGrant, port: int): string[] => {
+      const t = target(port, "secret");
+      const del = httpCall(
+        g,
+        t,
+        ApiRequest { method: "DELETE", path: "/v1/apps/x", body: "" },
+      ).unwrap();
+      const big = httpCall(g, t, ApiRequest { method: "GET", path: "/v1/big", body: "" }).unwrap();
+      const miss = httpCall(
+        g,
+        t,
+        ApiRequest { method: "GET", path: "/v1/nothing", body: "" },
+      ).unwrap();
+      const unrouted = httpCall(
+        g,
+        t,
+        ApiRequest { method: "GET", path: "/v1/unknown", body: "" },
+      ).unwrap();
+      return [
+        del.status.toString() + ":" + del.body,
+        big.status.toString() + big.body,
+        miss.status.toString(),
+        unrouted.status.toString(),
+      ];
+    },
+  );
+  assertEqString(out[0], "204:", "204 has no body");
+  assertEqString(out[1], "200[\"abc\",\"d\"]", "chunks are joined");
+  assertEqString(out[2], "404", "handler error");
+  assertEqString(out[3], "404", "no route");
+}
+
+@Test
+function anUnreachableOrbitdIsAnErrorNotACrash(host: Host): void {
+  const err = withNet(
+    host,
+    (net: NetGrant): string => {
+      return httpCall(
+        net,
+        target(1, "x"),
+        ApiRequest { method: "GET", path: "/v1/apps", body: "" },
+      ).unwrapErr();
+    },
+  );
+  assert(err.startsWith("cannot reach orbitd at 127.0.0.1:1"), err);
+}
+
+@Test
+function aTokenWithALineBreakIsRefusedNotSent(host: Host): void {
+  const err = withNet(
+    host,
+    (net: NetGrant): string => {
+      return httpCall(
+        net,
+        target(1, "a\r\nX-Evil: 1"),
+        ApiRequest { method: "GET", path: "/v1/apps", body: "" },
+      ).unwrapErr();
+    },
+  );
+  assert(err.includes("header"), err);
+}
+
+@Test
+function theWorkerPoolServesTypedCallsFromHandlers(host: Host): void {
+  const out = withOrbitd(
+    host,
+    (g: NetGrant, port: int): string[] => {
+      // the same arrangement as main.or: workers hold the grant, handlers hold only the channel
+      return scopeNet(
+        g,
+        (s: Scope, wg: NetGrant): string[] => {
+          const calls = channel<NetCall>(8);
+          const rx = calls.rx;
+          const t = target(port, "secret");
+          const w1 = spawnNet(s, wg, (x: NetGrant): int => apiWorker(x, t, rx));
+          const w2 = spawnNet(s, wg, (x: NetGrant): int => apiWorker(x, t, rx));
+          const api = netApi(calls.tx);
+          const apps = listApps(api);
+          const id = publish(api, "orders", "hello!");
+          calls.tx.close();
+          w1.join();
+          w2.join();
+          return [
+            apps.isOk() ? "apps ok" : apps.unwrapErr(),
+            id.isOk() ? id.unwrap().toString() : id.unwrapErr(),
+          ];
+        },
+      );
+    },
+  );
+  assertEqString(out[0], "apps ok", "listApps");
+  assertEqString(out[1], "6", "publish sent 6 bytes");
+}

@@ -1,0 +1,246 @@
+// The console as an orin-ui program: the model, the messages and `update`.
+//
+// `update` is pure. Messages come in two kinds: what the user did (RunNow, Activate, ...), which `update` mostly ignores, and what
+// the effects found out (Show, Notice, LinesArrived, ...), which `update` applies. The effects are in effects.or: for a user
+// message they call the API and return the second kind.
+import { parseQuery, FormSpace, PlusAsSpace } from "std:url";
+import {
+  AppSummary, AppDetail, Run, Span, LogLine, KvNamespace, KvView, Queue, DeadView,
+} from "./types";
+
+export type AppView = {
+  detail: AppDetail;
+  runs: Run[];
+  namespaces: KvNamespace[];
+  kv: Option<KvView>;
+  confirmDelete: bool;
+};
+
+export type RunView = { run: Run; spans: Span[]; logs: LogLine[]; };
+
+export type QueuesView = {
+  queues: Queue[];
+  dead: Option<DeadView>;
+  formQueue: string;
+  formBody: string;
+  // Bumped after a successful publish: the form's key changes, so the diff replaces the form and the browser's inputs are empty
+  // again (the model does not see what is typed, so clearing the model's draft alone would change nothing on screen).
+  formGen: int;
+};
+
+export type Page =
+  AppsPage(AppSummary[])
+  | AppPage(AppView)
+  | RunsPage(Run[])
+  | RunPage(RunView)
+  | LogsPage
+  | QueuesPage(QueuesView)
+  | NoticePage(string, string, bool);
+
+// A line under the page title: what the last action did. `href` is "" or a link target.
+export type Flash = { text: string; href: string; bad: bool; };
+
+export type LogFilter = { app: string; level: string; contains: string; };
+
+export type LogState = {
+  filter: LogFilter;
+  following: bool;
+  lines: LogLine[];
+  lastId: int;
+  error: string;
+};
+
+export type Model = { page: Page; flash: Flash; logs: LogState; };
+
+export type Msg =
+  Noop
+  | Refresh
+  | RunNow
+  | AskDelete
+  | CancelDelete
+  | ConfirmDelete
+  | Activate(int)
+  | ShowKv(string)
+  | HideKv
+  | Redrive(string)
+  | ShowDead(string)
+  | HideDead
+  | PublishForm(string)
+  | FilterForm(string)
+  | ToggleFollow
+  | ClearLines
+  | Show(Page)
+  | Notice(Flash)
+  | ShowKvEntries(KvView)
+  | ShowDeadLetters(DeadView)
+  | LinesArrived(LogLine[])
+  | StreamFailed(string);
+
+// The most lines the live log keeps; older ones scroll away.
+export function maxLines(): int {
+  return 500;
+}
+
+export function noFlash(): Flash {
+  return Flash { text: "", href: "", bad: false };
+}
+
+export function goodFlash(text: string, href: string): Flash {
+  return Flash { text: text, href: href, bad: false };
+}
+
+export function badFlash(text: string): Flash {
+  return Flash { text: text, href: "", bad: true };
+}
+
+export function emptyFilter(): LogFilter {
+  return LogFilter { app: "", level: "", contains: "" };
+}
+
+export function emptyLogs(): LogState {
+  return LogState { filter: emptyFilter(), following: false, lines: [], lastId: 0, error: "" };
+}
+
+export function initialModel(page: Page): Model {
+  return Model { page: page, flash: noFlash(), logs: emptyLogs() };
+}
+
+// The value of a field of a url-encoded form body (the payload of a `submit` event), "" when absent.
+export function formField(encoded: string, name: string): string {
+  const pairs = parseQuery(encoded, PlusAsSpace);
+  if (pairs.isErr()) {
+    return "";
+  }
+  for (const p of pairs.unwrap()) {
+    if (p.key == name) {
+      return p.value;
+    }
+  }
+  return "";
+}
+
+export function filterFromForm(encoded: string): LogFilter {
+  return LogFilter {
+    app: formField(encoded, "app").trim(),
+    level: formField(encoded, "level"),
+    contains: formField(encoded, "contains"),
+  };
+}
+
+function withPage(m: Model, p: Page): Model {
+  return Model { page: p, flash: m.flash, logs: m.logs };
+}
+
+function withLogs(m: Model, l: LogState): Model {
+  return Model { page: m.page, flash: m.flash, logs: l };
+}
+
+function lastLine(lines: LogLine[], fallback: int): int {
+  let top = fallback;
+  for (const l of lines) {
+    if (l.id > top) {
+      top = l.id;
+    }
+  }
+  return top;
+}
+
+// Appends new lines, keeps the newest `maxLines()`.
+export function appendLines(s: LogState, fresh: LogLine[]): LogState {
+  let all = s.lines.concat(fresh);
+  const cap = maxLines().toUsize();
+  if (all.length > cap) {
+    all = all.slice(all.length - cap, all.length);
+  }
+  return LogState {
+    filter: s.filter,
+    following: s.following,
+    lines: all,
+    lastId: lastLine(fresh, s.lastId),
+    error: "",
+  };
+}
+
+export function update(m: Model, msg: Msg): Model {
+  return match (msg) {
+    Show(p) => withPage(m, p),
+    Notice(f) => Model { page: m.page, flash: f, logs: m.logs },
+    AskDelete => match (m.page) {
+      AppPage(v) => withPage(m, AppPage(AppView { ...v, confirmDelete: true })),
+      _ => m,
+    },
+    CancelDelete => match (m.page) {
+      AppPage(v) => withPage(m, AppPage(AppView { ...v, confirmDelete: false })),
+      _ => m,
+    },
+    HideKv => match (m.page) {
+      AppPage(v) => withPage(m, AppPage(AppView { ...v, kv: None })),
+      _ => m,
+    },
+    ShowKvEntries(kv) => match (m.page) {
+      AppPage(v) => withPage(m, AppPage(AppView { ...v, kv: Some(kv) })),
+      _ => m,
+    },
+    HideDead => match (m.page) {
+      QueuesPage(v) => withPage(m, QueuesPage(QueuesView { ...v, dead: None })),
+      _ => m,
+    },
+    ShowDeadLetters(d) => match (m.page) {
+      QueuesPage(v) => withPage(m, QueuesPage(QueuesView { ...v, dead: Some(d) })),
+      _ => m,
+    },
+    PublishForm(encoded) => match (m.page) {
+      QueuesPage(v) => withPage(
+        m,
+        QueuesPage(QueuesView {
+          ...v,
+          formQueue: formField(encoded, "queue").trim(),
+          formBody: formField(encoded, "body"),
+        }),
+      ),
+      _ => m,
+    },
+    FilterForm(encoded) => withLogs(
+      m,
+      LogState {
+        filter: filterFromForm(encoded),
+        following: m.logs.following,
+        lines: [],
+        lastId: 0,
+        error: "",
+      },
+    ),
+    ToggleFollow => withLogs(
+      m,
+      LogState {
+        filter: m.logs.filter,
+        following: !m.logs.following,
+        lines: m.logs.following ? m.logs.lines : [],
+        lastId: m.logs.following ? m.logs.lastId : 0,
+        error: "",
+      },
+    ),
+    ClearLines => withLogs(
+      m,
+      LogState {
+        filter: m.logs.filter,
+        following: m.logs.following,
+        lines: [],
+        lastId: m.logs.lastId,
+        error: "",
+      },
+    ),
+    LinesArrived(ls) => withLogs(m, appendLines(m.logs, ls)),
+    StreamFailed(e) => withLogs(
+      m,
+      LogState {
+        filter: m.logs.filter,
+        following: m.logs.following,
+        lines: m.logs.lines,
+        lastId: m.logs.lastId,
+        error: e,
+      },
+    ),
+    _ => m,
+  };
+}

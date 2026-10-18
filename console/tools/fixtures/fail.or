@@ -1,0 +1,7 @@
+// A queue consumer that always fails: after max_attempts deliveries its message is dead-lettered. For the console's e2e script.
+import { exit } from "std:process";
+
+function main(): void {
+  console.log("failing on purpose");
+  exit(3);
+}

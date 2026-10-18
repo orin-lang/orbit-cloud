@@ -1,0 +1,384 @@
+// The screens of the console, as orin-ui views: `view(model)` is a pure function of the model.
+import ox from "./ui";
+import {
+  Node, Attr, cls, classIf, key, attr, href, style, value, selected, disabled, onClick, onValue,
+  onSubmit, placeholder, title, text, when,
+} from "orin-ui";
+import { seg } from "./api";
+import {
+  AppSummary, Deployment, Run, Span, LogLine, KvNamespace, KvView, Queue, DeadLetter, DeadView,
+} from "./types";
+import {
+  Model, Msg, Flash, AppView, RunView, QueuesView, LogState, Page, AppsPage, AppPage, RunsPage,
+  RunPage, LogsPage, QueuesPage, NoticePage, RunNow, AskDelete, CancelDelete, ConfirmDelete,
+  Activate, ShowKv, HideKv, Redrive, ShowDead, HideDead, PublishForm, FilterForm, ToggleFollow,
+  ClearLines, Refresh,
+} from "./model";
+import { dateTime, timeOfDay, millis, microsAsMs, kib, optInt, clip } from "./fmt";
+
+function statusClass(s: string): string {
+  return s == "succeeded" ? "ok" : s == "failed" ? "bad" : "warn";
+}
+
+function levelClass(l: string): string {
+  return l == "error" ? "bad" : l == "warn" ? "warn" : l == "debug" || l == "trace" ? "muted" : "";
+}
+
+export function appHref(name: string): string {
+  return "/apps/" + seg(name);
+}
+
+export function runHref(id: string): string {
+  return "/runs/" + seg(id);
+}
+
+function Empty(what: string): Node<Msg> {
+  return <p attrs={Some([cls("muted")])}>{what}</p>;
+}
+
+function FlashLine(f: Flash): Node<Msg> {
+  if (f.text.length == 0) {
+    return <div attrs={Some([cls("flash hidden")])}></div>;
+  }
+  return <div attrs={Some([classIf("flash", "bad", f.bad)])}>
+    <span>{f.text}</span>
+    {f.href.length > 0 ? <a attrs={Some([href(f.href)])}>open</a> : text("")}
+  </div>;
+}
+
+// ------------------------------------------------------------------------------------------------ apps
+
+function AppRow(a: AppSummary): Node<Msg> {
+  return <tr attrs={Some([key(a.name)])}>
+    <td><a attrs={Some([href(appHref(a.name))])}>{a.name}</a></td>
+    <td>{a.kind}</td>
+    <td>{a.version > 0 ? a.version.toString() : "-"}</td>
+    <td>{a.kind == "job" ? "" : a.workerRunning ? "running" : "stopped"}</td>
+    <td attrs={Some([cls("muted")])}>{dateTime(a.createdAt)}</td>
+  </tr>;
+}
+
+function AppsView(apps: AppSummary[]): Node<Msg> {
+  if (apps.length == 0) {
+    return <div>
+      <h2>Apps</h2>
+      <p attrs={Some([cls("muted")])}>No apps yet. Deploy one with <code>occtl deploy NAME app.wasm</code>.</p>
+    </div>;
+  }
+  return <div>
+    <h2>Apps</h2>
+    <table>
+      <thead><tr><th>Name</th><th>Kind</th><th>Version</th><th>Worker</th><th>Created</th></tr></thead>
+      <tbody>{apps.map(a => AppRow(a))}</tbody>
+    </table>
+  </div>;
+}
+
+// ------------------------------------------------------------------------------------------------ one app
+
+function DeploymentRow(d: Deployment, active: int): Node<Msg> {
+  return <tr attrs={Some([key(d.id.toString())])}>
+    <td>{d.version.toString()}{d.id == active ? " (active)" : ""}</td>
+    <td attrs={Some([cls("mono")])}>{clip(d.module, 12)}</td>
+    <td attrs={Some([cls("mono")])}>{d.spec}</td>
+    <td attrs={Some([cls("muted")])}>{dateTime(d.createdAt)}</td>
+    <td>{d.id == active ? text("") : <button attrs={Some([onClick(Activate(d.id))])}>Activate</button>}</td>
+  </tr>;
+}
+
+function RunRow(r: Run, withApp: bool): Node<Msg> {
+  return <tr attrs={Some([key(r.id)])}>
+    <td attrs={Some([cls("mono")])}><a attrs={Some([href(runHref(r.id))])}>{r.id}</a></td>
+    {withApp ? <td><a attrs={Some([href(appHref(r.app))])}>{r.app}</a></td> : text("")}
+    <td>{r.trigger}</td>
+    <td attrs={Some([cls(statusClass(r.status))])}>{r.status}</td>
+    <td>{optInt(r.exitCode)}</td>
+    <td>{millis(r.wallMs)}</td>
+    <td attrs={Some([cls("muted")])}>{dateTime(r.startedAt)}</td>
+  </tr>;
+}
+
+function RunsTable(runs: Run[], withApp: bool): Node<Msg> {
+  if (runs.length == 0) {
+    return Empty("No runs yet.");
+  }
+  return <table>
+    <thead><tr>
+      <th>Run</th>{withApp ? <th>App</th> : text("")}<th>Trigger</th><th>Status</th><th>Exit</th><th>Wall</th><th>Started</th>
+    </tr></thead>
+    <tbody>{runs.map(r => RunRow(r, withApp))}</tbody>
+  </table>;
+}
+
+function KvEntries(kv: KvView): Node<Msg> {
+  return <div attrs={Some([cls("card")])}>
+    <div attrs={Some([cls("row")])}>
+      <strong>{kv.namespace}</strong>
+      <button attrs={Some([onClick(HideKv)])}>Close</button>
+    </div>
+    {kv.entries.length == 0 ? Empty("No entries.") : <table>
+      <thead><tr><th>Key</th><th>Value</th><th>Size</th></tr></thead>
+      <tbody>{kv.entries.map(e => <tr attrs={Some([key(e.key)])}>
+        <td attrs={Some([cls("mono")])}>{e.key}</td>
+        <td attrs={Some([cls("mono")])}>{clip(e.value, 200)}</td>
+        <td>{e.size.toString()}</td>
+      </tr>)}</tbody>
+    </table>}
+  </div>;
+}
+
+function Namespaces(v: AppView): Node<Msg> {
+  if (v.namespaces.length == 0) {
+    return Empty("No data.");
+  }
+  return <div attrs={Some([cls("row")])}>
+    {v.namespaces.map(n => <button attrs={Some([key(n.namespace), onClick(ShowKv(n.namespace))])}>{n.namespace + " (" + n.entries.toString() + ")"}</button>)}
+  </div>;
+}
+
+function DeleteControls(v: AppView): Node<Msg> {
+  if (v.confirmDelete) {
+    return <span attrs={Some([cls("row")])}>
+      <span attrs={Some([cls("bad")])}>Delete {v.detail.name} with all its runs, logs and data?</span>
+      <button attrs={Some([cls("danger"), onClick(ConfirmDelete)])}>Yes, delete</button>
+      <button attrs={Some([onClick(CancelDelete)])}>Cancel</button>
+    </span>;
+  }
+  return <button attrs={Some([onClick(AskDelete)])}>Delete app</button>;
+}
+
+function AppDetailView(v: AppView): Node<Msg> {
+  const d = v.detail;
+  return <div>
+    <h2>{d.name}</h2>
+    <div attrs={Some([cls("row")])}>
+      {d.kind == "service" ? text("") : <button attrs={Some([onClick(RunNow)])}>Run now</button>}
+      <button attrs={Some([onClick(Refresh)])}>Refresh</button>
+      {DeleteControls(v)}
+    </div>
+    <p attrs={Some([cls("muted")])}>{d.kind + (d.workerDeployment > 0 ? ", worker running deployment " + d.workerDeployment.toString() : "")}</p>
+    <h2>Deployments</h2>
+    <table>
+      <thead><tr><th>Version</th><th>Module</th><th>Spec</th><th>Created</th><th></th></tr></thead>
+      <tbody>{d.deployments.map(x => DeploymentRow(x, d.activeDeployment))}</tbody>
+    </table>
+    <h2>Runs</h2>
+    {RunsTable(v.runs, false)}
+    <h2>KV</h2>
+    {Namespaces(v)}
+    {v.kv.isSome() ? KvEntries(v.kv.unwrap()) : text("")}
+  </div>;
+}
+
+// ------------------------------------------------------------------------------------------------ runs
+
+function RunsView(runs: Run[]): Node<Msg> {
+  return <div>
+    <h2>Recent runs</h2>
+    {RunsTable(runs, true)}
+  </div>;
+}
+
+// "12.3%" from a part per thousand.
+function percent(permille: int): string {
+  return (permille / 10).toString() + "." + (permille % 10).toString() + "%";
+}
+
+function SpanRow(s: Span, t0: int, total: int): Node<Msg> {
+  const left = (s.startUs - t0) * 1000 / total;
+  const width = (s.endUs - s.startUs) * 1000 / total;
+  return <tr attrs={Some([key(s.name + s.startUs.toString())])}>
+    <td attrs={Some([cls(s.parentId.length > 0 ? "child" : "root")])}>{s.name}</td>
+    <td>{microsAsMs(s.endUs - s.startUs)}</td>
+    <td>
+      <div attrs={Some([cls("bar"), title(s.attrs)])}>
+        <span attrs={Some([style("left:" + percent(left) + ";width:" + percent(width))])}></span>
+      </div>
+    </td>
+  </tr>;
+}
+
+function Waterfall(spans: Span[]): Node<Msg> {
+  if (spans.length == 0) {
+    return Empty("No spans recorded.");
+  }
+  let t0 = spans[0].startUs;
+  let t1 = spans[0].endUs;
+  for (const s of spans) {
+    if (s.startUs < t0) {
+      t0 = s.startUs;
+    }
+    if (s.endUs > t1) {
+      t1 = s.endUs;
+    }
+  }
+  const total = t1 - t0 > 0 ? t1 - t0 : 1;
+  return <table>
+    <thead><tr><th>Span</th><th>Duration</th><th>Timeline</th></tr></thead>
+    <tbody>{spans.map(s => SpanRow(s, t0, total))}</tbody>
+  </table>;
+}
+
+function LogLineRow(l: LogLine, showApp: bool): Node<Msg> {
+  return <div attrs={Some([key(l.id.toString()), cls("line")])}>
+    <span attrs={Some([cls("muted")])}>{timeOfDay(l.ts)}</span>
+    <span attrs={Some([cls("lvl " + levelClass(l.level))])}>{l.level}</span>
+    {showApp ? <span attrs={Some([cls("app")])}>{l.app}</span> : text("")}
+    <span attrs={Some([cls("msg")])}>{l.message}</span>
+  </div>;
+}
+
+function RunDetailView(v: RunView): Node<Msg> {
+  const r = v.run;
+  return <div>
+    <h2>Run <span attrs={Some([cls("mono")])}>{r.id}</span> of <a attrs={Some([href(appHref(r.app))])}>{r.app}</a></h2>
+    <div attrs={Some([cls("card")])}>
+      <span attrs={Some([cls(statusClass(r.status))])}>{r.status}</span>
+      <span>{" - exit " + optInt(r.exitCode) + " - " + millis(r.wallMs) + " - trigger " + r.trigger}</span>
+      <span>{" - peak memory " + kib(r.peakMemory) + " - fuel " + optInt(r.fuel)}</span>
+      {r.error.length > 0 ? <div attrs={Some([cls("bad mono")])}>{r.error}</div> : text("")}
+      <div attrs={Some([cls("muted mono")])}>{"trace " + r.traceId + ", deployment " + r.deployment.toString()}</div>
+    </div>
+    <h2>Trace</h2>
+    {Waterfall(v.spans)}
+    <h2>Logs</h2>
+    {v.logs.length == 0 ? Empty("(none)") : <div attrs={Some([cls("logs")])}>{v.logs.map(l => LogLineRow(l, false))}</div>}
+  </div>;
+}
+
+// ------------------------------------------------------------------------------------------------ live logs
+
+function LevelOption(name: string, label: string, current: string): Node<Msg> {
+  return <option attrs={Some([value(name), selected(name == current)])}>{label}</option>;
+}
+
+function newestFirstOf(lines: LogLine[]): LogLine[] {
+  let out: LogLine[] = [];
+  let i = lines.length;
+  while (i > 0) {
+    i -= 1;
+    out.push(lines[i]);
+  }
+  return out;
+}
+
+function LogsView(s: LogState): Node<Msg> {
+  const f = s.filter;
+  // newest first in the DOM: the box is a column-reverse flex container, so it shows oldest at the top and stays scrolled to
+  // the newest line
+  const newestFirst = newestFirstOf(s.lines);
+  return <div>
+    <h2>Live logs</h2>
+    <form attrs={Some([cls("row"), onValue("submit", (v) => FilterForm(v))])}>
+      <input attrs={Some([attr("name", "app"), placeholder("app"), value(f.app)])} />
+      <select attrs={Some([attr("name", "level")])}>
+        {LevelOption("", "any level", f.level)}
+        {LevelOption("trace", "trace", f.level)}
+        {LevelOption("debug", "debug", f.level)}
+        {LevelOption("info", "info", f.level)}
+        {LevelOption("warn", "warn", f.level)}
+        {LevelOption("error", "error", f.level)}
+      </select>
+      <input attrs={Some([attr("name", "contains"), placeholder("contains"), value(f.contains)])} />
+      <button attrs={Some([attr("type", "submit")])}>Apply</button>
+      <button attrs={Some([attr("type", "button"), classIf("toggle", "on", s.following), onClick(ToggleFollow)])}>{s.following ? "Following - pause" : "Follow"}</button>
+      <button attrs={Some([attr("type", "button"), onClick(ClearLines)])}>Clear</button>
+    </form>
+    {s.error.length > 0 ? <p attrs={Some([cls("bad")])}>{s.error}</p> : text("")}
+    {s.following || s.lines.length > 0
+      ? <div attrs={Some([cls("logs live")])}>{newestFirst.map(l => LogLineRow(l, true))}</div>
+      : Empty("Press Follow to stream the log lines that match.")}
+  </div>;
+}
+
+// ------------------------------------------------------------------------------------------------ queues
+
+function QueueRow(q: Queue): Node<Msg> {
+  return <tr attrs={Some([key(q.queue)])}>
+    <td>{q.queue}</td>
+    <td>{q.ready.toString()}</td>
+    <td>{q.leased.toString()}</td>
+    <td attrs={Some([cls(q.dead > 0 ? "bad" : "")])}>{q.dead.toString()}</td>
+    <td>{q.done.toString()}</td>
+    <td>
+      {q.dead > 0 ? <button attrs={Some([onClick(ShowDead(q.queue))])}>Dead letters</button> : text("")}
+      {q.dead > 0 ? <button attrs={Some([onClick(Redrive(q.queue))])}>Redrive</button> : text("")}
+    </td>
+  </tr>;
+}
+
+function DeadRow(d: DeadLetter): Node<Msg> {
+  return <tr attrs={Some([key(d.id.toString())])}>
+    <td>{d.id.toString()}</td>
+    <td>{d.attempts.toString()}</td>
+    <td attrs={Some([cls("mono")])}>{clip(d.body, 200)}</td>
+    <td attrs={Some([cls("bad mono")])}>{d.lastError}</td>
+  </tr>;
+}
+
+function DeadView_(d: DeadView): Node<Msg> {
+  return <div attrs={Some([cls("card")])}>
+    <div attrs={Some([cls("row")])}>
+      <strong>{"Dead letters of " + d.queue}</strong>
+      <button attrs={Some([onClick(HideDead)])}>Close</button>
+    </div>
+    {d.letters.length == 0 ? Empty("None.") : <table>
+      <thead><tr><th>Id</th><th>Attempts</th><th>Message</th><th>Last error</th></tr></thead>
+      <tbody>{d.letters.map(x => DeadRow(x))}</tbody>
+    </table>}
+  </div>;
+}
+
+function QueuesView_(v: QueuesView): Node<Msg> {
+  return <div>
+    <h2>Queues</h2>
+    {v.queues.length == 0 ? Empty("No queues yet.") : <table>
+      <thead><tr><th>Queue</th><th>Ready</th><th>Leased</th><th>Dead</th><th>Done</th><th></th></tr></thead>
+      <tbody>{v.queues.map(q => QueueRow(q))}</tbody>
+    </table>}
+    {v.dead.isSome() ? DeadView_(v.dead.unwrap()) : text("")}
+    <h2>Publish</h2>
+    <form attrs={Some([key("publish" + v.formGen.toString()), cls("row"), onValue("submit", (f) => PublishForm(f))])}>
+      <input attrs={Some([attr("name", "queue"), placeholder("queue"), value(v.formQueue)])} />
+      <input attrs={Some([attr("name", "body"), placeholder("message"), attr("size", "40"), value(v.formBody)])} />
+      <button attrs={Some([attr("type", "submit")])}>Send</button>
+    </form>
+  </div>;
+}
+
+// ------------------------------------------------------------------------------------------------ the page
+
+function NoticeView(head: string, body: string, bad: bool): Node<Msg> {
+  return <div>
+    <h2>{head}</h2>
+    <p attrs={Some([cls(bad ? "bad" : "")])}>{body}</p>
+    <p><a attrs={Some([href("/")])}>Back to the apps</a></p>
+  </div>;
+}
+
+export function pageView(p: Page): Node<Msg> {
+  return match (p) {
+    AppsPage(apps) => AppsView(apps),
+    AppPage(v) => AppDetailView(v),
+    RunsPage(runs) => RunsView(runs),
+    RunPage(v) => RunDetailView(v),
+    LogsPage => Placeholder(),
+    QueuesPage(v) => QueuesView_(v),
+    NoticePage(h, b, bad) => NoticeView(h, b, bad),
+  };
+}
+
+function Placeholder(): Node<Msg> {
+  return <div></div>;
+}
+
+export function view(m: Model): Node<Msg> {
+  const body = match (m.page) {
+    LogsPage => LogsView(m.logs),
+    _ => pageView(m.page),
+  };
+  return <div attrs={Some([cls("screen")])}>
+    {FlashLine(m.flash)}
+    {body}
+  </div>;
+}
