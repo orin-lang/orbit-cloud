@@ -196,7 +196,7 @@ fn system_audit(
     let entry = oc_store::NewAudit {
         actor_kind: "user".into(),
         actor_id: user.map(|u| u.id.clone()),
-        actor_label: label.to_owned(),
+        actor_label: label.chars().take(200).collect(),
         action: action.into(),
         ip: ip.map(|i| i.to_string()),
         ..oc_store::NewAudit::default()

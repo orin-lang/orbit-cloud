@@ -95,7 +95,8 @@ Once the first user exists, a node without `ORBIT_CLOUD_TOKEN` stops being open:
 | `Own` | owner | delete the org, change owners, delete projects |
 
 Instance-wide actions (create organisations, create users, read the global audit log) need the break-glass admin or a
-user with `is_admin` (the first user, created by setup).
+user with `is_admin` (the first user, created by setup). An instance admin is the operator and counts as an owner of
+every organisation.
 
 ### One place that decides: `Authz`
 
@@ -134,6 +135,9 @@ only (a restart prints a new one) and the endpoint answers 409 once a user exist
   HTTPS): `HttpOnly`, `SameSite=Lax`, `Path=/`, `Secure` when the request was HTTPS (directly or via a trusted
   proxy's `X-Forwarded-Proto`). The database only has `sha256(value)`. Lifetime 14 days, sliding. `POST /v1/auth/logout`
   deletes the row.
+* The cookie has no `Domain` attribute, so it belongs to the console host alone: project hosts (`shop.cloud.example.com`)
+  and customers' domains never receive it, and the `__Host-` prefix stops a project app from planting a cookie of that
+  name for the whole domain.
 * **CSRF**: cookie-authenticated requests with a method other than GET/HEAD/OPTIONS must carry
   `X-CSRF-Token: <token>`, where the token is `sha256("orbit-csrf:" + session value)` in hex, returned by login and
   `GET /v1/me` (the cookie itself is `HttpOnly`, so scripts never see it). If an `Origin` header is present its host must
@@ -143,7 +147,7 @@ only (a restart prints a new one) and the endpoint answers 409 once a user exist
 
 ### API tokens
 
-`oc_` + 32 random bytes in base32/hex. Shown once; stored as sha256. A token has a name, a **scope** (`{"org": "acme"}`
+`oc_` + 32 random bytes, hex. Shown once; stored as sha256. A token has a name, a **scope** (`{"org": "acme"}`
 or `{"project": "shop"}`), a **role**, an optional expiry, and optionally the user that created it. Rules:
 
 * a user can only create tokens with a role not above their own role in that scope (a token never escalates);
@@ -197,8 +201,7 @@ for `/` yet. More routes: `POST /v1/projects/{p}/routes {"path_prefix": "/api", 
 Built on hyper (`hyper-util` legacy client for upstream, auto HTTP/1+2 server). Request and response bodies are
 streamed. WebSocket and other `Upgrade` requests are tunnelled. The proxy sets or appends `X-Forwarded-For`,
 `X-Forwarded-Proto`, `X-Forwarded-Host`, and `X-Request-Id` (kept when present and sane, generated otherwise; also
-returned to the client). Timeouts: header read 30 s, upstream response headers 60 s (`--upstream-timeout-secs`), idle
-connections 90 s. Request bodies are limited (`--max-body-mb`, default 100) with 413. A refused connection to the
+returned to the client). Timeouts: header read 30 s, upstream response headers 60 s (`--upstream-timeout-secs`). Request bodies are limited (`--max-body-mb`, default 100) with 413. A refused connection to the
 app is 502, an unknown path 404, a missing app port 503. Hop-by-hop headers are stripped.
 
 **Observability**: every proxied request becomes one log line in the app's logs (`GET /path 200 12ms host=... ip=...`,
