@@ -1,0 +1,21 @@
+[package]
+name = "oc-store"
+description = "Orbit Cloud persistence: apps, deployments, runs, logs, spans, KV and queues in SQLite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

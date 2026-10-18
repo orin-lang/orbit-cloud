@@ -1,0 +1,12 @@
+#!/bin/sh
+# Starts orbitd with the admin token from the systemd credential `orbit-cloud.token`. Without a token the API would
+# be open to the network, so the appliance refuses to start.
+set -eu
+tok="${CREDENTIALS_DIRECTORY:-/nonexistent}/orbit-cloud.token"
+if [ ! -s "$tok" ]; then
+    echo "orbitd: no admin token. Pass the credential orbit-cloud.token (see /usr/share/orbit-cloud/README)." >&2
+    exit 78
+fi
+ORBIT_CLOUD_TOKEN=$(cat "$tok")
+export ORBIT_CLOUD_TOKEN
+exec /usr/bin/orbitd "$@"

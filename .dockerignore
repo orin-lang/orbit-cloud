@@ -1,0 +1,11 @@
+target/
+.git/
+.github/
+data/
+*.db
+*.db-wal
+*.db-shm
+docs/
+deploy/os/
+*.md
+!crates/**/*.md

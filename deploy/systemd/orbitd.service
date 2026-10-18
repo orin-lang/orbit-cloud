@@ -1,0 +1,55 @@
+[Unit]
+Description=Orbit Cloud node (orbitd)
+Documentation=https://github.com/orin-lang/orbit-cloud
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+# The admin token and any other settings: ORBIT_CLOUD_TOKEN=..., ORBIT_CLOUD_LISTEN=..., RUST_LOG=...
+# Create it with:  install -m 0600 /dev/null /etc/orbit-cloud/orbitd.env
+EnvironmentFile=-/etc/orbit-cloud/orbitd.env
+Environment=ORBIT_CLOUD_LISTEN=0.0.0.0:8080
+Environment=ORBIT_CLOUD_DATA=/var/lib/orbit-cloud
+ExecStart=/usr/bin/orbitd
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=30
+
+# Identity and state: a transient user, /var/lib/orbit-cloud owned by it.
+DynamicUser=yes
+StateDirectory=orbit-cloud
+StateDirectoryMode=0750
+UMask=0077
+
+# Sandbox. WebAssembly apps run inside orbitd, so the process itself needs no privileges at all.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateUsers=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# The WebAssembly engine compiles code at run time, so writable+executable memory must stay allowed.
+MemoryDenyWriteExecute=no
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+
+[Install]
+WantedBy=multi-user.target

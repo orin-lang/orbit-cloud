@@ -1,0 +1,6 @@
+#!/bin/sh
+# Enables orbitd and networking; nothing else runs. Masks what a console appliance does not need.
+set -eu
+systemctl enable orbitd.service systemd-networkd.service systemd-resolved.service
+systemctl mask apt-daily.timer apt-daily-upgrade.timer e2scrub_all.timer fstrim.timer
+mkdir -p /var/lib/orbit-cloud

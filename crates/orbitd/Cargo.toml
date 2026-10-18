@@ -1,0 +1,32 @@
+[package]
+name = "orbitd"
+description = "Orbit Cloud node: runs WebAssembly apps on Orbit with logs, traces, metrics, KV and queues"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+oc-store.workspace = true
+orbit-abi.workspace = true
+orbit-runtime.workspace = true
+orbit-caps.workspace = true
+tokio.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+futures-util.workspace = true
+tokio-stream.workspace = true
+
+[dev-dependencies]
+wat.workspace = true
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tempfile.workspace = true
+
+[lints]
+workspace = true
