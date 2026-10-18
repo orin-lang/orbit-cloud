@@ -2,7 +2,7 @@
 import { assert, assertEq, assertEqString } from "std:test";
 import {
   Api, ApiRequest, ApiResponse, seg, query, call, listApps, getApp, getRun, runTrace, logsAfter,
-  runNow,
+  runNow, stats, nodeInfo,
 } from "../src/api";
 import { JsonValue } from "std:json";
 import { parseJson } from "../src/jv";
@@ -134,4 +134,52 @@ function spansAndLogsAndQueuesDecode(): void {
   assertEq(qs[0].dead, 3, "dead");
   const dead = decodeDead(json("[{\"id\":9,\"body\":\"b\",\"attempts\":2,\"last_error\":null}]"));
   assertEqString(dead[0].lastError, "", "no error text");
+}
+
+@Test
+function statsCarryBucketsPercentilesAndTheServerClock(): void {
+  const api = fakeApi();
+  const s = stats(api, "", 0, 0, 3600000).unwrap();
+  assertEq(s.buckets.length.toInt(), 24, "buckets");
+  assertEq(s.until, 1792400000000, "until comes from orbitd");
+  assert(
+    s.buckets[0].p95.isSome() && s.buckets[5].p95.isNone(),
+    "an empty bucket has no percentile",
+  );
+  assertEq(s.buckets[5].succeeded + s.buckets[5].failed, 0, "and no runs");
+  assertEq(s.totals.p95.unwrap(), 4100, "totals");
+  const none = stats(api, "nobody", 0, 0, 3600000).unwrap();
+  assertEq(none.totals.succeeded, 0, "an app without runs");
+  const echo: Api = (req: ApiRequest): Result<ApiResponse, string> => Ok(
+    status(
+      200,
+      "{\"since\":0,\"until\":0,\"bucket_ms\":1,\"buckets\":[],\"totals\":{\"t\":0,\"succeeded\":0,\"failed\":0,\"running\":0,\"logs\":0}}",
+    ),
+  );
+  let seen = "";
+  const spy: Api = (req: ApiRequest): Result<ApiResponse, string> => Err(req.path);
+  assertEqString(
+    stats(spy, "a b", 5, 9, 7200000).unwrapErr(),
+    "/v1/stats?app=a%20b&since=5&until=9&bucket=7200000",
+    "the query",
+  );
+  assertEqString(
+    stats(spy, "", 0, 0, 3600000).unwrapErr(),
+    "/v1/stats?bucket=3600000",
+    "defaults are left to orbitd",
+  );
+}
+
+@Test
+function theNodeAndRunsDecode(): void {
+  const n = nodeInfo(fakeApi()).unwrap();
+  assertEqString(n.version, "0.1.0", "version");
+  assertEq(n.abi, 1, "abi");
+  assertEqString(n.kinds.join(","), "job,service,consumer", "kinds are plain strings");
+  assertEq(n.workers.length.toInt(), 1, "workers");
+  assertEqString(n.workers[0], "mailer", "worker app");
+  const r = getRun(fakeApi(), "abc").unwrap();
+  assertEq(r.wallUs.unwrap(), 546123, "microseconds");
+  assertEq(r.wallMs.unwrap(), 546, "milliseconds");
+  assert(r.hostCalls.includes("log/v1"), "host calls as text");
 }

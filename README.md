@@ -22,6 +22,7 @@ target/release/occtl run hello          # prints the run and its log lines
 target/release/occtl trace <run-id>     # load / instantiate / execute spans
 open http://127.0.0.1:8080/             # web console
 console/run.sh                          # or the console written in Orin: http://127.0.0.1:8081/ (see console/README.md)
+console/tools/demo.sh                   # orbitd and that console with demo data and history
 ```
 
 A queue consumer gets each message on stdin; exit 0 acknowledges it:

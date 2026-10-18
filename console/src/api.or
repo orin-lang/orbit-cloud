@@ -4,11 +4,12 @@ import { JsonValue } from "std:json";
 import { percentEncode, PercentSpace } from "std:url";
 import { parseJson, errorText, items, intOr, member, asInt } from "./jv";
 import {
-  AppSummary, AppDetail, Run, Span, LogLine, KvNamespace, KvEntry, Queue, DeadLetter,
+  AppSummary, AppDetail, Run, Span, LogLine, KvNamespace, KvEntry, Queue, DeadLetter, Stats,
+  NodeInfo,
 } from "./types";
 import {
   decodeApps, decodeAppDetail, decodeRun, decodeRuns, decodeSpans, decodeLogs, decodeNamespaces,
-  decodeKvEntries, decodeQueues, decodeDead,
+  decodeKvEntries, decodeQueues, decodeDead, decodeStats, decodeNode,
 } from "./decode";
 
 // `path` starts with /v1 and includes the query string.
@@ -174,4 +175,28 @@ export function logsAfter(
     [app, level, contains, after > 0 ? after.toString() : "", limit.toString()],
   );
   return Ok(decodeLogs(getJson(api, "/v1/logs" + q)?));
+}
+
+// Run statistics per bucket (orbitd's GET /v1/stats). `until` 0: now, as orbitd sees it; `since` 0: 24 hours before `until`.
+export function stats(
+  api: Api,
+  app: string,
+  since: int,
+  until: int,
+  bucketMs: int,
+): Result<Stats, string> {
+  const q = query(
+    ["app", "since", "until", "bucket"],
+    [
+      app,
+      since > 0 ? since.toString() : "",
+      until > 0 ? until.toString() : "",
+      bucketMs.toString(),
+    ],
+  );
+  return Ok(decodeStats(getJson(api, "/v1/stats" + q)?));
+}
+
+export function nodeInfo(api: Api): Result<NodeInfo, string> {
+  return Ok(decodeNode(getJson(api, "/v1/node")?));
 }

@@ -36,9 +36,11 @@ export type Run = {
   error: string;
   startedAt: int;
   wallMs: Option<int>;
+  wallUs: Option<int>;
   fuel: Option<int>;
   peakMemory: Option<int>;
   traceId: string;
+  hostCalls: string;
 };
 
 export type Span = { name: string; parentId: string; startUs: int; endUs: int; attrs: string; };
@@ -59,3 +61,25 @@ export type KvView = { namespace: string; entries: KvEntry[]; };
 export type Queue = { queue: string; ready: int; leased: int; dead: int; done: int; };
 export type DeadLetter = { id: int; body: string; attempts: int; lastError: string; };
 export type DeadView = { queue: string; letters: DeadLetter[]; };
+
+// One time bucket of GET /v1/stats; the percentiles are None for a bucket without finished runs.
+export type StatsBucket = {
+  t: int;
+  succeeded: int;
+  failed: int;
+  running: int;
+  p50: Option<int>;
+  p95: Option<int>;
+  logs: int;
+};
+
+export type Stats = {
+  since: int;
+  until: int;
+  bucketMs: int;
+  buckets: StatsBucket[];
+  totals: StatsBucket;
+};
+
+// GET /v1/node.
+export type NodeInfo = { version: string; abi: int; kinds: string[]; workers: string[]; };

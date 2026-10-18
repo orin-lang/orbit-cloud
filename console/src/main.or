@@ -18,7 +18,15 @@ import { Command, hubLoop } from "./hub";
 import { Deps, buildApp } from "./app";
 import { program } from "./program";
 
-type Boot = { apiToken: string; consoleToken: string; js: string; css: string; entropy: string; };
+type Boot = {
+  apiToken: string;
+  consoleToken: string;
+  js: string;
+  kitCss: string;
+  kitJs: string;
+  css: string;
+  entropy: string;
+};
 
 function slurp(fs: FsGrant, path: string): Result<string, string> {
   const r = readFile(fs, path);
@@ -66,7 +74,9 @@ function boot(fs: FsGrant, cfg: Config): Result<Boot, string> {
       "the console needs a secret to sign in with: give --console-token(-file) or --api-token(-file)",
     );
   }
-  const js = slurp(fs, cfg.clientJs)?;
+  const js = slurp(fs, cfg.clientDir + "/orin-ui.js")?;
+  const kitCss = slurp(fs, cfg.clientDir + "/orin-ui-kit.css")?;
+  const kitJs = slurp(fs, cfg.clientDir + "/orin-ui-kit.js")?;
   const css = slurp(fs, cfg.assetsDir + "/console.css")?;
   const entropy = entropyPool(fs);
   if (entropy.length == 0) {
@@ -76,6 +86,8 @@ function boot(fs: FsGrant, cfg: Config): Result<Boot, string> {
     apiToken: apiToken,
     consoleToken: consoleToken,
     js: js,
+    kitCss: kitCss,
+    kitJs: kitJs,
     css: css,
     entropy: entropy,
   });
@@ -113,8 +125,14 @@ function run(net: NetGrant, cfg: Config, b: Boot): void {
         api: netApi(calls.tx),
         hub: cmds.tx,
         consoleToken: b.consoleToken,
-        assets: [textAsset("console.css", b.css), textAsset("orin-ui.js", b.js)],
+        assets: [
+          textAsset("console.css", b.css),
+          textAsset("orin-ui.js", b.js),
+          textAsset("orin-ui-kit.css", b.kitCss),
+          textAsset("orin-ui-kit.js", b.kitJs),
+        ],
         accessLog: cfg.accessLog,
+        nodeLabel: cfg.apiHost + ":" + cfg.apiPort.toString(),
       });
       const done = serve(
         g,

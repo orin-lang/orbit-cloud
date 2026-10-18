@@ -1,0 +1,5 @@
+// A job that writes lines at several levels, like a nightly report.
+function main(): void {
+  console.log("report: collecting figures");
+  console.log("report: wrote 148 rows");
+}

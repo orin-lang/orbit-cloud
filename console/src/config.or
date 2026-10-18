@@ -10,7 +10,7 @@ export type Config = {
   consoleToken: string;
   consoleTokenFile: string;
   assetsDir: string;
-  clientJs: string;
+  clientDir: string;
   workers: int;
   accessLog: bool;
 };
@@ -26,7 +26,7 @@ export function defaultConfig(): Config {
     consoleToken: "",
     consoleTokenFile: "",
     assetsDir: "assets",
-    clientJs: ".orin/packages/orin-ui/client/orin-ui.js",
+    clientDir: ".orin/packages/orin-ui/client",
     workers: 4,
     accessLog: true,
   };
@@ -41,7 +41,7 @@ export function usage(): string {
       + "  --console-token TOKEN     the secret that signs in to the console (default: the orbitd token)\n"
       + "  --console-token-file FILE\n"
       + "  --assets DIR              directory with console.css (default assets)\n"
-      + "  --client-js FILE          orin-ui's client/orin-ui.js (default .orin/packages/orin-ui/client/orin-ui.js)\n"
+      + "  --client-dir DIR          orin-ui's client/ directory: orin-ui.js, orin-ui-kit.css and .js (default .orin/packages/orin-ui/client)\n"
       + "  --workers N               parallel requests to orbitd (default 4)\n"
       + "  --quiet                   no access log\n";
 }
@@ -105,8 +105,8 @@ export function parseArgs(argv: string[]): Result<Config, string> {
         c = Config { ...c, consoleTokenFile: v };
       } else if (a == "--assets") {
         c = Config { ...c, assetsDir: v };
-      } else if (a == "--client-js") {
-        c = Config { ...c, clientJs: v };
+      } else if (a == "--client-dir") {
+        c = Config { ...c, clientDir: v };
       } else if (a == "--workers") {
         const n = parseInt(v);
         if (n.isNone() || n.unwrap() < 1 || n.unwrap() > 64) {

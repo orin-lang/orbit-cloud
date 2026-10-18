@@ -17,7 +17,7 @@ export function dateTime(ms: int): string {
   return date + " " + (rest.length >= 8 ? rest.substring(0, 8) : rest);
 }
 
-function two(n: int): string {
+export function two(n: int): string {
   return n < 10 ? "0" + n.toString() : n.toString();
 }
 
@@ -69,4 +69,87 @@ export function padEnd(s: string, n: int): string {
     out += " ";
   }
   return out;
+}
+
+// A duration in microseconds, with a sensible precision: "850 us", "1.23 ms", "12.3 ms", "123 ms", "1.23 s", "2m 05s".
+export function duration(us: int): string {
+  if (us < 0) {
+    return "-";
+  }
+  if (us < 1000) {
+    return us.toString() + " µs";
+  }
+  if (us < 10000) {
+    return (us / 1000).toString() + "." + hundredths(us % 1000 / 10) + " ms";
+  }
+  if (us < 100000) {
+    return (us / 1000).toString() + "." + (us % 1000 / 100).toString() + " ms";
+  }
+  if (us < 1000000) {
+    return (us / 1000).toString() + " ms";
+  }
+  if (us < 60000000) {
+    return (us / 1000000).toString() + "." + hundredths(us % 1000000 / 10000) + " s";
+  }
+  const secs = us / 1000000;
+  return (secs / 60).toString() + "m " + two(secs % 60) + "s";
+}
+
+function hundredths(n: int): string {
+  return n < 10 ? "0" + n.toString() : n.toString();
+}
+
+// The run time of a run in microseconds: `wall_us`, or the millisecond figure of runs recorded before microseconds existed.
+export function runUs(wallUs: Option<int>, wallMs: Option<int>): Option<int> {
+  if (wallUs.isSome()) {
+    return wallUs;
+  }
+  if (wallMs.isSome()) {
+    return Some(wallMs.unwrap() * 1000);
+  }
+  return None;
+}
+
+// "just now", "5 min ago", "3 h ago", "2 d ago" for a time `t` seen at `now` (both Unix ms); the date when `now` is unknown (0).
+export function ago(now: int, t: int): string {
+  if (now <= 0 || t <= 0) {
+    return dateTime(t);
+  }
+  const s = (now - t) / 1000;
+  if (s < 45) {
+    return "just now";
+  }
+  if (s < 3600) {
+    return (s / 60 < 1 ? 1 : s / 60).toString() + " min ago";
+  }
+  if (s < 86400) {
+    return (s / 3600).toString() + " h ago";
+  }
+  return (s / 86400).toString() + " d ago";
+}
+
+// A byte count: "512 B", "1.8 MiB".
+export function bytes(n: int): string {
+  if (n < 1024) {
+    return n.toString() + " B";
+  }
+  if (n < 1048576) {
+    return (n / 1024).toString() + "." + (n % 1024 * 10 / 1024).toString() + " KiB";
+  }
+  return (n / 1048576).toString() + "." + (n % 1048576 * 10 / 1048576).toString() + " MiB";
+}
+
+// "HH:MM" of a Unix time in milliseconds (UTC).
+export function hourMinute(ms: int): string {
+  const day = (ms % 86400000 + 86400000) % 86400000;
+  return two(day / 3600000) + ":" + two(day / 60000 % 60);
+}
+
+// One decimal percentage of part/whole: "3.1%"; "0%" for no whole.
+export function ratePercent(part: int, whole: int): string {
+  if (whole <= 0) {
+    return "0%";
+  }
+  const tenths = part * 1000 / whole;
+  return (tenths / 10).toString() + "." + (tenths % 10).toString() + "%";
 }

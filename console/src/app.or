@@ -16,17 +16,26 @@ import {
   Hub, newSession, resolveEvent, applyMessages, joinSession, peekModel, login, isLoggedIn, logout,
 } from "./hub";
 import {
-  Model, Msg, Page, initialModel, formField, NoticePage, LogsPage, StreamFailed, LinesArrived,
-  Refresh,
+  Model, Msg, Page, initialModel, formField, NoticePage, StreamFailed, LinesArrived, Refresh,
+  hasLiveLogs, TabOverview, OverviewPage, AppsPage, AppPage, RunsPage, RunPage, LogsPage,
+  QueuesPage, KvPage, SettingsPage,
 } from "./model";
 import {
-  Route, RouteApps, RouteApp, RouteRuns, RouteRun, RouteLogs, RouteQueues, loadPage, isNotFound,
-  perform, fetchLines,
+  Route, RouteOverview, RouteApps, RouteApp, RouteRuns, RouteRun, RouteLogs, RouteQueues, RouteKv,
+  RouteSettings, loadModel, isNotFound, perform, fetchLines, tabOf,
 } from "./effects";
 import { program } from "./program";
-import { Nav, NavApps, NavRuns, NavLogs, NavQueues, NavNone, screenPage, loginPage } from "./page";
+import { screenPage, loginPage } from "./page";
 
-export type Deps = { api: Api; hub: Hub; consoleToken: string; assets: Asset[]; accessLog: bool; };
+export type Deps = {
+  api: Api;
+  hub: Hub;
+  consoleToken: string;
+  assets: Asset[];
+  accessLog: bool;
+  // How the shell names the node: "host:port" of orbitd.
+  nodeLabel: string;
+};
 
 const COOKIE: string = "orbit_console";
 
@@ -130,49 +139,66 @@ function logoutHandler(d: Deps): Handler {
 
 // ------------------------------------------------------------------------------------------------ screens
 
-function titleOf(nav: Nav): string {
-  return match (nav) {
-    NavApps => "Apps - Orbit Cloud",
-    NavRuns => "Runs - Orbit Cloud",
-    NavLogs => "Logs - Orbit Cloud",
-    NavQueues => "Queues - Orbit Cloud",
-    NavNone => "Orbit Cloud",
-  };
-}
-
-function isLogs(p: Page): bool {
+function titleOf(p: Page): string {
   return match (p) {
-    LogsPage => true,
-    _ => false,
+    OverviewPage(v) => "Overview - Orbit Cloud",
+    AppsPage(v) => "Apps - Orbit Cloud",
+    AppPage(v) => v.detail.name + " - Orbit Cloud",
+    RunsPage(v) => "Runs - Orbit Cloud",
+    RunPage(v) => "Run " + v.run.id + " - Orbit Cloud",
+    LogsPage => "Logs - Orbit Cloud",
+    QueuesPage(v) => "Queues - Orbit Cloud",
+    KvPage(v) => "KV - Orbit Cloud",
+    SettingsPage(v) => "Settings - Orbit Cloud",
+    NoticePage(t, b, bad) => t + " - Orbit Cloud",
   };
 }
 
 // Builds the page of `route`: loads its data, opens a UI session on it and renders the first screen.
-function screen(d: Deps, route: Route, nav: Nav): Result<Response, WebError> {
-  const loaded = loadPage(d.api, route);
+function screen(d: Deps, route: Route): Result<Response, WebError> {
+  const loaded = loadModel(d.api, route, d.nodeLabel);
   let status = 200;
-  let page: Page = NoticePage("", "", false);
+  let model = initialModel(NoticePage("", "", false), None, d.nodeLabel);
   if (loaded.isOk()) {
-    page = loaded.unwrap();
+    model = loaded.unwrap();
   } else {
     const e = loaded.unwrapErr();
     status = isNotFound(e) ? 404 : 502;
-    page = NoticePage(isNotFound(e) ? "Not found" : "Cannot reach orbitd", e, true);
+    model = initialModel(
+      NoticePage(isNotFound(e) ? "Not found" : "Cannot reach orbitd", e, true),
+      None,
+      d.nodeLabel,
+    );
   }
-  const model = initialModel(page);
   const sid = newSession(d.hub, model);
   if (sid.isNone()) {
     return Err(statusError(503, "the console is shutting down"));
   }
   const dom = sessionOf<Model, Msg>(program(), model).dom;
-  const html = screenPage(titleOf(nav), nav, renderHtml(dom), sid.unwrap(), 0, isLogs(page));
+  const html = screenPage(
+    titleOf(model.page),
+    renderHtml(dom),
+    sid.unwrap(),
+    0,
+    hasLiveLogs(model.page),
+  );
   return Ok(noStore(Response.html(status, html)));
 }
 
-function screenHandler(d: Deps, route: Route, nav: Nav): Handler {
-  return (req: Request): Result<Response, WebError> => screen(d, route, nav);
+function screenHandler(d: Deps, route: Route): Handler {
+  return (req: Request): Result<Response, WebError> => screen(d, route);
 }
 
+function appHandler(d: Deps): Handler {
+  return (req: Request): Result<Response, WebError> => {
+    const name = req.param("name").unwrapOr("");
+    const tab = tabOf(req.param("tab").unwrapOr(""));
+    if (tab.isNone()) {
+      return Err(notFound("no such tab"));
+    }
+    return screen(d, RouteApp(name, tab.unwrap(), req.query("ns").unwrapOr("")));
+  };
+}
 // ------------------------------------------------------------------------------------------------ events and stream
 
 function json(body: string): Response {
@@ -234,7 +260,7 @@ function streamHandler(d: Deps): Handler {
     const events = channel<SseEvent>(4);
     const m = model.unwrap();
     let delay = 1500;
-    if (m.logs.following && isLogs(m.page)) {
+    if (m.logs.following && hasLiveLogs(m.page)) {
       delay = 500;
       const fetched = fetchLines(d.api, m.logs.filter, m.logs.lastId, 200);
       let msgs: Msg[] = [];
@@ -271,22 +297,15 @@ export function buildApp(d: Deps): Router {
   app.get("/login", loginForm(d));
   app.post("/login", loginSubmit(d));
   app.post("/logout", withMiddleware(guard, logoutHandler(d)));
-  app.get("/", withMiddleware(guard, screenHandler(d, RouteApps, NavApps)));
-  app.get("/apps", withMiddleware(guard, screenHandler(d, RouteApps, NavApps)));
-  app.get("/runs", withMiddleware(guard, screenHandler(d, RouteRuns, NavRuns)));
-  app.get("/logs", withMiddleware(guard, screenHandler(d, RouteLogs, NavLogs)));
-  app.get("/queues", withMiddleware(guard, screenHandler(d, RouteQueues, NavQueues)));
-  app.get(
-    "/apps/:name",
-    withMiddleware(
-      guard,
-      (req: Request): Result<Response, WebError> => screen(
-        d,
-        RouteApp(req.param("name").unwrapOr("")),
-        NavApps,
-      ),
-    ),
-  );
+  app.get("/", withMiddleware(guard, screenHandler(d, RouteOverview)));
+  app.get("/apps", withMiddleware(guard, screenHandler(d, RouteApps)));
+  app.get("/runs", withMiddleware(guard, screenHandler(d, RouteRuns)));
+  app.get("/logs", withMiddleware(guard, screenHandler(d, RouteLogs)));
+  app.get("/queues", withMiddleware(guard, screenHandler(d, RouteQueues)));
+  app.get("/kv", withMiddleware(guard, screenHandler(d, RouteKv)));
+  app.get("/settings", withMiddleware(guard, screenHandler(d, RouteSettings)));
+  app.get("/apps/:name", withMiddleware(guard, appHandler(d)));
+  app.get("/apps/:name/:tab", withMiddleware(guard, appHandler(d)));
   app.get(
     "/runs/:id",
     withMiddleware(
@@ -294,7 +313,6 @@ export function buildApp(d: Deps): Router {
       (req: Request): Result<Response, WebError> => screen(
         d,
         RouteRun(req.param("id").unwrapOr("")),
-        NavRuns,
       ),
     ),
   );

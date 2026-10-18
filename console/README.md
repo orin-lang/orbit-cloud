@@ -5,8 +5,24 @@ The web console of Orbit Cloud written as an [Orin](https://github.com/orin-lang
 live patch stream). It replaces nothing in `orbitd` yet: the Rust daemon still serves its own static console at `/`. This one runs
 as a separate program and talks to orbitd's `/v1` API like any Orbit Cloud app could (it needs one `connect` grant, to orbitd).
 
-Screens: apps; one app (deployments with activate, runs, KV namespaces and entries, run now, delete); recent runs; a run with its
-trace waterfall and logs; live logs with filters; queues with dead letters, redrive and publish.
+Screens, in a Cloudflare-style layout (left sidebar, top bar with the node status, theme toggle and user menu), light and dark:
+
+* **Overview**: stat cards (apps, runs in 24 h with the change against the day before, error rate, p95 run time, queue backlog, dead
+  letters, active workers, log lines), a stacked runs-per-hour bar chart (succeeded versus failed), a run-duration chart (p50 and
+  p95), the latest failed runs and the queues that need attention.
+* **Apps**: a sortable table with kind, version, last run, a 24 hour sparkline and the worker state.
+* **An app**, in tabs: Overview (metrics, chart, recent runs), Deployments (versions, the spec as Limits / Capabilities / Environment
+  groups or raw JSON, a diff against the previous version, activate behind a confirm dialog), Runs, Logs (live, filtered to the app),
+  KV (namespaces, entries, a value viewer) and Settings (delete, with the app's name typed to confirm).
+* **A run**: status, execution time in microseconds or milliseconds, memory, a span waterfall on a labelled time axis, the host calls
+  and the log lines with level colours.
+* **Logs**: filter bar (app, level, text), live follow with pause, monospaced coloured lines.
+* **Queues**: a card per queue with ready / leased / dead / done, a dead-letter table with redrive, publish in a dialog.
+* **KV** (all namespaces) and **Settings** (the node, this console, the theme).
+
+The components (shell, sidebar, tables, tabs, dialogs, charts) are not part of this package: they are the
+[orin-ui component kit](https://github.com/orin-lang/orin-ui#component-kit), and the charts are SVG generated in Orin. The data for
+the charts comes from orbitd's `GET /v1/stats`.
 
 ## Run it
 
@@ -28,7 +44,7 @@ Open <http://127.0.0.1:8081/> and sign in with the console token (by default the
 | `--api URL` | orbitd, `http://HOST:PORT` (default `http://127.0.0.1:8080`); no TLS |
 | `--api-token TOKEN`, `--api-token-file FILE` | bearer token for orbitd |
 | `--console-token TOKEN`, `--console-token-file FILE` | what signs in to the console; default: the orbitd token |
-| `--assets DIR`, `--client-js FILE` | `console.css` (default `assets`) and orin-ui's `orin-ui.js` (default: the copy in the fetched dependency) |
+| `--assets DIR`, `--client-dir DIR` | `console.css` (default `assets`) and orin-ui's `client/` directory with `orin-ui.js`, `orin-ui-kit.css` and `orin-ui-kit.js` (default: the copy in the fetched dependency) |
 | `--workers N` | parallel requests to orbitd (default 4) |
 | `--quiet` | no access log |
 
@@ -66,7 +82,8 @@ a TLS proxy before exposing it, and mark the cookie `Secure` there. Login tokens
 | `src/main.or`, `config.or` | arguments, files, grants, tasks, `serve` |
 | `src/transport.or` | HTTP/1.1 client on `std:net` + `std:http`, worker pool, `netApi` |
 | `src/api.or`, `decode.or`, `jv.or`, `types.or` | typed calls to `/v1`, tolerant JSON decoding |
-| `src/model.or`, `effects.or`, `views.or`, `ui.or`, `program.or` | the orin-ui program: model, messages, API effects, views (OX), provider |
+| `src/model.or`, `effects.or`, `program.or` | the orin-ui program: model, messages, API effects (loading screens, acting on messages) |
+| `src/views*.or`, `fmt.or` | the screens, built from the kit (`views_common.or`: shell, run tables, log lines; one file per area) and number/time formatting |
 | `src/hub.or`, `app.or`, `page.or` | sessions and logins, routes and auth, the HTML shell |
 
 ## Dependencies
@@ -76,6 +93,17 @@ records them). orin-web's repository is private: anything that runs `orin fetch`
 `github.com/orin-lang/orin-web`, e.g. `git config --global url."https://x-access-token:$TOKEN@github.com/".insteadOf
 "https://github.com/"` with a read-only token. For local work against checkouts replace a line by `{ path = "../../orin-web" }`.
 
+## Demo
+
+```sh
+console/tools/demo.sh                    # orbitd + console with demo data on 127.0.0.1:18080 / 18081, token "demo"; Ctrl-C cleans up
+console/tools/demo.sh --shots DIR        # light and dark screenshots of every screen (needs Playwright), then stops
+```
+
+Seven apps (jobs, a service, two consumers), two versions of `etl` with KV data, a failing job, a consumer whose messages become
+dead letters, and 36 hours of runs, spans and log lines that `tools/backfill.py` (a dev-only helper) writes into orbitd's SQLite file
+so that the charts have a history. The demo programs in `tools/demo/*.or` are plain `console.log` programs.
+
 ## Tests
 
 Needs the Orin toolchain **built from `orin-lang` main**: the latest release (0.1.0-beta.2) predates the std API used here
@@ -83,8 +111,9 @@ Needs the Orin toolchain **built from `orin-lang` main**: the latest release (0.
 
 ```sh
 cd console
-orin fetch && orin test               # 83 tests: routes through orin-web's TestClient against a fake orbitd, orin-ui view tests,
-                                      #  the HTTP client over loopback sockets, model, effects, hub, decoders
+orin fetch && orin test               # 106 tests: routes through orin-web's TestClient against a fake orbitd, orin-ui view tests
+                                      #  (shell, tables, forms, dialogs, charts, patches), the HTTP client over loopback sockets,
+                                      #  model, effects, hub, decoders, formatting
 orin fmt --check
 tools/e2e.sh                          # real orbitd + console on 127.0.0.1:18080/18081, checks with curl; with
                                       #  PLAYWRIGHT=/path/to/node_modules/playwright (and CHROMIUM=...) it also drives a browser

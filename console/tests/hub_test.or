@@ -10,7 +10,12 @@ import {
   initialModel, LogsPage, NoticePage, Notice, goodFlash, ToggleFollow, Noop,
 } from "../src/model";
 import { program } from "../src/program";
-import { entropy } from "./support";
+import { entropy, pathIn } from "./support";
+
+// The path of the Follow button on the logs page.
+function followPath(): int[] {
+  return pathIn(initialModel(LogsPage, None, "n"), "button", "Follow");
+}
 
 function withHub(body: (hub: Hub) => void): void {
   scope((s: Scope): void => {
@@ -26,8 +31,8 @@ function withHub(body: (hub: Hub) => void): void {
 @Test
 function sessionsHoldTheirOwnModel(): void {
   withHub(hub => {
-    const a = newSession(hub, initialModel(LogsPage)).unwrap();
-    const b = newSession(hub, initialModel(NoticePage("t", "x", false))).unwrap();
+    const a = newSession(hub, initialModel(LogsPage, None, "n")).unwrap();
+    const b = newSession(hub, initialModel(NoticePage("t", "x", false), None, "n")).unwrap();
     assert(a != b, "distinct ids");
     applyMessages(hub, a, [Notice(goodFlash("hello", ""))]);
     assertEqString(peekModel(hub, a).unwrap().flash.text, "hello", "a changed");
@@ -39,7 +44,7 @@ function sessionsHoldTheirOwnModel(): void {
 @Test
 function messagesAreNumberedInTheOrderTheyWereComputed(): void {
   withHub(hub => {
-    const a = newSession(hub, initialModel(LogsPage)).unwrap();
+    const a = newSession(hub, initialModel(LogsPage, None, "n")).unwrap();
     assert(
       applyMessages(hub, a, [Noop]).unwrap().startsWith("{\"t\":\"patch\",\"n\":0,"),
       "first is 0",
@@ -64,12 +69,12 @@ function messagesAreNumberedInTheOrderTheyWereComputed(): void {
 @Test
 function anEventResolvesToTheMessageOfItsElement(): void {
   withHub(hub => {
-    const a = newSession(hub, initialModel(LogsPage)).unwrap();
+    const a = newSession(hub, initialModel(LogsPage, None, "n")).unwrap();
     // [0,1,1,4] is the Follow button of the logs page
-    const r = resolveEvent(hub, a, ClientEvent { path: [0, 1, 1, 4], event: "click", value: "" });
+    const r = resolveEvent(hub, a, ClientEvent { path: followPath(), event: "click", value: "" });
     assert(r.isSome(), "found");
     assert(
-      resolveEvent(hub, a, ClientEvent { path: [0, 1, 1, 4], event: "dblclick", value: "" }).isNone(),
+      resolveEvent(hub, a, ClientEvent { path: followPath(), event: "dblclick", value: "" }).isNone(),
       "no such event",
     );
     assert(
@@ -86,16 +91,16 @@ function anEventResolvesToTheMessageOfItsElement(): void {
 @Test
 function theLeastRecentlyUsedSessionIsDropped(): void {
   withHub(hub => {
-    const first = newSession(hub, initialModel(LogsPage)).unwrap();
-    const second = newSession(hub, initialModel(LogsPage)).unwrap();
+    const first = newSession(hub, initialModel(LogsPage, None, "n")).unwrap();
+    const second = newSession(hub, initialModel(LogsPage, None, "n")).unwrap();
     let i: int = 2;
     while (i < maxSessions()) {
-      newSession(hub, initialModel(LogsPage));
+      newSession(hub, initialModel(LogsPage, None, "n"));
       i += 1;
     }
     peekModel(hub, first);
     applyMessages(hub, first, [Noop]); // touches `first`
-    newSession(hub, initialModel(LogsPage)); // one too many: `second` is the oldest
+    newSession(hub, initialModel(LogsPage, None, "n")); // one too many: `second` is the oldest
     assert(peekModel(hub, first).isSome(), "the recently used one stays");
     assert(peekModel(hub, second).isNone(), "the oldest went");
   });

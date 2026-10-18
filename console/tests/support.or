@@ -1,10 +1,14 @@
 // Shared by the tests: a fake orbitd (an `Api` over canned answers) and a console wired to it.
+import { assert } from "std:test";
 import { Scope, scope, spawn, channel } from "std:task";
 import { TestClient, Router, textAsset } from "orin-web";
+import { Dom, DElement, DText, sessionOf } from "orin-ui";
 import { Api, ApiRequest, ApiResponse } from "../src/api";
 import { Command, hubLoop } from "../src/hub";
 import { Deps, buildApp } from "../src/app";
 import { program } from "../src/program";
+import { Model, Msg, update } from "../src/model";
+import { Route, loadModel } from "../src/effects";
 
 export function ok(body: string): ApiResponse {
   return ApiResponse { status: 200, body: body };
@@ -29,15 +33,13 @@ function helloApp(): string {
       {"id":1,"app":"hello","version":1,"module":"0fbd9e9e1e654b035c28a97d793f2813c1c8309f34c66874c746565dccc0b83d","spec":`
       + spec("job")
       + `,"created_at":1792336579470},
-      {"id":2,"app":"hello","version":2,"module":"aaaabbbbccccddddeeee","spec":`
-      + spec("job")
-      + `,"created_at":1792336580000}],
+      {"id":2,"app":"hello","version":2,"module":"aaaabbbbccccddddeeee","spec":{"kind":"job","kv_namespaces":["cfg","seen"],"limits":{"memory_mb":128,"timeout_ms":5000},"env":{"REGION":"eu-west"}},"created_at":1792336580000}],
     "worker_deployment":null}`;
 }
 
 function run(id: string, status: string): string {
   return `{"id":"` + id + `","app":"hello","deployment":2,"trigger":"api","status":"` + status
-      + `","exit_code":0,"error":null,"started_at":1792336579483,"finished_at":1792336580029,"wall_ms":546,"fuel":null,"peak_memory":1835008,"host_calls":{"log/v1":1},"trace_id":"80eed6fd379d723139e9c2a6fd26043c","message_id":null}`;
+      + `","exit_code":0,"error":null,"started_at":1792336579483,"finished_at":1792336580029,"wall_ms":546,"wall_us":546123,"fuel":null,"peak_memory":1835008,"host_calls":{"log/v1":1},"trace_id":"80eed6fd379d723139e9c2a6fd26043c","message_id":null}`;
 }
 
 function trace(): string {
@@ -80,14 +82,25 @@ function afterOf(path: string): int {
 // `/v1/apps/svc` is a service (runs answer 409).
 export function route(method: string, path: string, body: string): ApiResponse {
   const key = method + " " + path;
+  if (method == "GET" && path.startsWith("/v1/stats")) {
+    return ok(statsJson(path));
+  }
+  if (key == "GET /v1/node") {
+    return ok(
+      `{"kinds":["job","service","consumer"],"orbit_abi":1,"version":"0.1.0","workers":[{"app":"mailer","deployment":3}]}`,
+    );
+  }
   if (key == "GET /v1/apps") {
     return ok(apps());
   }
   if (key == "GET /v1/apps/hello") {
     return ok(helloApp());
   }
-  if (key == "GET /v1/apps/hello/runs?limit=20") {
+  if (key == "GET /v1/apps/hello/runs?limit=100") {
     return ok("[" + run("abc", "succeeded") + "," + run("def", "failed") + "]");
+  }
+  if (key == "GET /v1/apps/worker/kv") {
+    return ok("[]");
   }
   if (key == "GET /v1/apps/hello/kv") {
     return ok(`[{"namespace":"cfg","entries":2}]`);
@@ -115,7 +128,7 @@ export function route(method: string, path: string, body: string): ApiResponse {
           + spec("service") + `,"created_at":1}],"worker_deployment":9}`,
     );
   }
-  if (key == "GET /v1/apps/svc/runs?limit=20") {
+  if (key == "GET /v1/apps/svc/runs?limit=100") {
     return ok("[]");
   }
   if (key == "GET /v1/apps/svc/kv") {
@@ -129,13 +142,13 @@ export function route(method: string, path: string, body: string): ApiResponse {
       `{"app":{"name":"<img src=x onerror=alert(1)>","created_at":1,"active_deployment":1},"deployments":[{"id":1,"app":"evil","version":1,"module":"<script>alert(1)</script>","spec":{"kind":"job"},"created_at":1}],"worker_deployment":null}`,
     );
   }
-  if (key == "GET /v1/apps/evil/runs?limit=20") {
+  if (key == "GET /v1/apps/evil/runs?limit=100") {
     return ok("[]");
   }
   if (key == "GET /v1/apps/evil/kv") {
     return ok("[]");
   }
-  if (key == "GET /v1/runs?limit=100") {
+  if (key == "GET /v1/runs?limit=100" || key == "GET /v1/runs?limit=200") {
     return ok("[" + run("abc", "succeeded") + "," + run("def", "failed") + "]");
   }
   if (key == "GET /v1/runs/abc") {
@@ -167,6 +180,34 @@ export function route(method: string, path: string, body: string): ApiResponse {
     return ok(logsAbove(afterOf(path)));
   }
   return status(404, `{"error":"the fake orbitd has no route ` + key + `"}`);
+}
+
+function bucketJson(t: int, ok: int, bad: int, p95: int): string {
+  return `{"t":` + t.toString() + `,"succeeded":` + ok.toString() + `,"failed":` + bad.toString()
+      + `,"running":0,"p50_us":` + (ok > 0 ? (900 + t % 7 * 10).toString() : "null") + `,"p95_us":`
+      + (ok > 0 ? p95.toString() : "null") + `,"logs":` + (ok + bad).toString() + `}`;
+}
+
+// Twenty-four hourly buckets ending at 1792400000000; hour 5 has no runs. `app=nobody` has none at all.
+function statsJson(path: string): string {
+  const until = 1792400000000;
+  const since = until - 24 * 3600000;
+  const nobody = path.includes("app=nobody");
+  let buckets: string[] = [];
+  let ok: int = 0;
+  let bad: int = 0;
+  let i: int = 0;
+  while (i < 24) {
+    const o = nobody || i == 5 ? 0 : 3 + i % 4;
+    const b = nobody || i == 5 ? 0 : i % 6 == 0 ? 1 : 0;
+    ok += o;
+    bad += b;
+    buckets.push(bucketJson(since + i * 3600000, o, b, 2400));
+    i += 1;
+  }
+  return `{"since":` + since.toString() + `,"until":` + until.toString()
+      + `,"bucket_ms":3600000,"buckets":[` + buckets.join(",") + `],"totals":`
+      + (nobody ? bucketJson(since, 0, 0, 0) : bucketJson(since, ok, bad, 4100)) + `}`;
 }
 
 export function fakeApi(): Api {
@@ -201,8 +242,14 @@ export function withConsoleOn(api: Api, body: (client: TestClient) => void): voi
       api: api,
       hub: cmds.tx,
       consoleToken: consoleToken(),
-      assets: [textAsset("console.css", "body { }"), textAsset("orin-ui.js", "// client")],
+      assets: [
+        textAsset("console.css", "body { }"),
+        textAsset("orin-ui.js", "// client"),
+        textAsset("orin-ui-kit.css", ".ou-x { }"),
+        textAsset("orin-ui-kit.js", "// kit"),
+      ],
       accessLog: false,
+      nodeLabel: "orbitd:8080",
     };
     body(new TestClient(buildApp(deps)));
     cmds.tx.close();
@@ -224,4 +271,56 @@ export function between(text: string, open: string, close: string): string {
   const rest = text.substring(start, text.length);
   const b = rest.indexOf(close);
   return b.isSome() ? rest.substring(0, b.unwrap()) : "";
+}
+
+// ------------------------------------------------------------------ finding elements in a screen
+
+function textOf(d: Dom): string {
+  return match (d) {
+    DText(s) => s,
+    DElement(tag, k, attrs, children) => children.map(c => textOf(c)).join(""),
+  };
+}
+
+function search(nodes: Dom[], tag: string, label: string, prefix: int[]): Option<int[]> {
+  let i: usize = 0;
+  while (i < nodes.length) {
+    const here = prefix.concat([i.toInt()]);
+    match (nodes[i]) {
+      DElement(t, k, attrs, children) => {
+        if (t == tag && textOf(nodes[i]).includes(label)) {
+          // prefer the innermost match: a form that contains the label deeper wins over its ancestors
+          const deeper = search(children, tag, label, here);
+          return deeper.isSome() ? deeper : Some(here);
+        }
+        const inner = search(children, tag, label, here);
+        if (inner.isSome()) {
+          return inner;
+        }
+      },
+      DText(s) => {},
+    }
+    i += 1;
+  }
+  return None;
+}
+
+// The path of the first `tag` element (button, a, form, ...) whose text contains `label`, in the screen of `model`.
+export function pathIn(model: Model, tag: string, label: string): int[] {
+  const found = search(sessionOf<Model, Msg>(program(), model).dom, tag, label, []);
+  assert(found.isSome(), "no <" + tag + "> with text '" + label + "' on the screen");
+  return found.unwrap();
+}
+
+// The first-render model of a route against the fake, after some messages (a dialog opened, ...).
+export function modelAfter(route: Route, msgs: Msg[]): Model {
+  let m = loadModel(fakeApi(), route, "orbitd:8080").unwrap();
+  for (const msg of msgs) {
+    m = update(m, msg);
+  }
+  return m;
+}
+
+export function pathText(p: int[]): string {
+  return "[" + p.map(i => i.toString()).join(",") + "]";
 }

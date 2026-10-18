@@ -62,7 +62,7 @@ printf '%s' "$TOKEN" > "$tmp/api-token"
 printf '%s' "$CONSOLE_TOKEN" > "$tmp/console-token"
 "$here/build/dev/orbit-console" --listen "127.0.0.1:$CONSOLE_PORT" --api "$ORBIT_CLOUD_URL" \
   --api-token-file "$tmp/api-token" --console-token-file "$tmp/console-token" \
-  --assets "$here/assets" --client-js "$here/.orin/packages/orin-ui/client/orin-ui.js" >"$tmp/console.log" 2>&1 &
+  --assets "$here/assets" --client-dir "${CLIENT_DIR:-$here/.orin/packages/orin-ui/client}" >"$tmp/console.log" 2>&1 &
 pids+=($!)
 c="http://127.0.0.1:$CONSOLE_PORT"
 for _ in $(seq 1 50); do curl -fs "$c/healthz" >/dev/null 2>&1 && break; sleep 0.1; done
@@ -72,28 +72,33 @@ echo "== sign-in"
 check "pages redirect to /login without a session" bash -c "curl -s -o /dev/null -w '%{http_code} %{redirect_url}' $c/ | grep -q '303 .*/login'"
 check "a wrong token is refused" bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -d token=nope $c/login)\" = 401 ]"
 check "the right token signs in and sets an HttpOnly cookie" bash -c "curl -s -i -c $tmp/jar -d token=$CONSOLE_TOKEN $c/login | tr -d '\r' | grep -qi '^set-cookie: orbit_console=.*HttpOnly'"
-check "a bearer token works for scripts" bash -c "curl -s -H 'Authorization: Bearer $CONSOLE_TOKEN' $c/runs | grep -q 'Recent runs'"
+check "a bearer token works for scripts" bash -c "curl -s -H 'Authorization: Bearer $CONSOLE_TOKEN' $c/runs | grep -q 'The latest 100 runs'"
 check "?token= is exchanged for a cookie and redirected" bash -c "curl -s -o /dev/null -w '%{http_code} %{redirect_url}' '$c/queues?token=$CONSOLE_TOKEN' | grep -q '303 .*/queues'"
 get() { curl -s -b "$tmp/jar" "$c$1"; }
 
 echo "== screens"
-check "apps list shows both apps" bash -c "curl -s -b $tmp/jar $c/ | grep -q 'href=\"/apps/hello\"' && curl -s -b $tmp/jar $c/ | grep -q 'href=\"/apps/flaky\"'"
-check "app page: deployments, active marker, run button, kv" bash -c "curl -s -b $tmp/jar $c/apps/hello | grep -q '2 (active)' && curl -s -b $tmp/jar $c/apps/hello | grep -q 'Run now' && curl -s -b $tmp/jar $c/apps/hello | grep -q 'cfg (2)'"
+page() { curl -s -b "$tmp/jar" "$c$1"; }
+check "overview: stat cards, charts, the shell" bash -c "curl -s -b $tmp/jar $c/ | grep -q 'Runs, last 24 h' && curl -s -b $tmp/jar $c/ | grep -q 'ou-chart-svg' && curl -s -b $tmp/jar $c/ | grep -q 'ou-sidebar'"
+check "apps list shows both apps" bash -c "curl -s -b $tmp/jar $c/apps | grep -q 'href=\"/apps/hello\"' && curl -s -b $tmp/jar $c/apps | grep -q 'href=\"/apps/flaky\"'"
+check "app overview: tabs and run now" bash -c "curl -s -b $tmp/jar $c/apps/hello | grep -q 'Run now' && curl -s -b $tmp/jar $c/apps/hello | grep -q 'href=\"/apps/hello/deployments\"'"
+check "deployments: spec groups, two versions" bash -c "curl -s -b $tmp/jar $c/apps/hello/deployments | grep -q '>v2<' && curl -s -b $tmp/jar $c/apps/hello/deployments | grep -q 'Capabilities'"
+check "kv tab: namespace" bash -c "curl -s -b $tmp/jar '$c/apps/hello/kv?ns=cfg' | grep -q 'ou-listbtn active'"
 run_id="$("$occtl" runs hello | awk 'NR==2 {print $1}')"
-check "run page: trace and logs" bash -c "curl -s -b $tmp/jar $c/runs/$run_id | grep -q '<td class=\"child\">execute</td>' && curl -s -b $tmp/jar $c/runs/$run_id | grep -q 'class=\"bar\"'"
+check "run page: waterfall and logs" bash -c "curl -s -b $tmp/jar $c/runs/$run_id | grep -q 'class=\"wf-name child\"' && curl -s -b $tmp/jar $c/runs/$run_id | grep -q 'logline'"
+check "run times have microsecond precision (µs or ms, never a bare 0 ms)" bash -c "! curl -s -b $tmp/jar $c/runs/$run_id | grep -q '>0 ms<'"
 check "recent runs lists the run" bash -c "curl -s -b $tmp/jar $c/runs | grep -q $run_id"
 check "queues page shows the dead letter" bash -c "curl -s -b $tmp/jar $c/queues | grep -q 'Dead letters'"
+check "kv overview" bash -c "curl -s -b $tmp/jar $c/kv | grep -q 'Browse'"
+check "settings shows the node" bash -c "curl -s -b $tmp/jar $c/settings | grep -q 'Orbit ABI'"
 check "logs page opens the stream" bash -c "curl -s -b $tmp/jar $c/logs | grep -q 'data-ou-stream=\"/ui/stream\"'"
 check "an unknown app is a 404 page" bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -b $tmp/jar $c/apps/nope)\" = 404 ]"
+check "an unknown tab is a 404" bash -c "[ \"\$(curl -s -o /dev/null -w '%{http_code}' -b $tmp/jar $c/apps/hello/bogus)\" = 404 ]"
 
 echo "== patch stream"
-sid="$(get /apps/hello | sed -n 's/.*data-ou-session="\([^"]*\)".*/\1/p')"
-patch="$(curl -s -b "$tmp/jar" -H "X-Orin-UI-Session: $sid" -d '{"t":"event","path":[0,1,1,0],"event":"click","value":""}' "$c/ui/events")"
-check "run now answers with a numbered patch" bash -c "echo '$patch' | grep -q '^{\"t\":\"patch\",\"n\":0,' && echo '$patch' | grep -q 'succeeded, exit 0'"
-lsid="$(get /logs | sed -n 's/.*data-ou-session="\([^"]*\)".*/\1/p')"
-curl -s -b "$tmp/jar" -H "X-Orin-UI-Session: $lsid" -d '{"t":"event","path":[0,1,1,4],"event":"click","value":""}' "$c/ui/events" >/dev/null
-"$occtl" run hello >/dev/null
-check "the stream pushes a log line that arrived after Follow" bash -c "curl -s -N --max-time 3 -b $tmp/jar '$c/ui/stream?s=$lsid' | grep -q '^data: {\"t\":\"patch\",\"n\":1,'"
+sid="$(page /logs | sed -n 's/.*data-ou-session="\([^"]*\)".*/\1/p')"
+mount="$(curl -s -b "$tmp/jar" -H "X-Orin-UI-Session: $sid" -d '{"t":"join"}' "$c/ui/events")"
+check "join answers with a numbered mount" bash -c "echo '$mount' | grep -q '^{\"t\":\"mount\",\"n\":0,'"
+check "the stream tells an idle browser when to come back" bash -c "curl -s -N --max-time 3 -b $tmp/jar '$c/ui/stream?s=$sid' | grep -q '^retry: 1500'"
 
 if command -v node >/dev/null && [ -n "${PLAYWRIGHT:-}" ]; then
   echo "== browser"

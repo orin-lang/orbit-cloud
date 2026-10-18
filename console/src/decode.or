@@ -1,8 +1,9 @@
 // JSON from the API to the console's types. Tolerant: see jv.or.
 import { JsonValue } from "std:json";
-import { items, member, strOr, intOr, boolOr, optStr, optInt, jsonText } from "./jv";
+import { items, member, strOr, intOr, boolOr, optStr, optInt, jsonText, asString } from "./jv";
 import {
   AppSummary, Deployment, AppDetail, Run, Span, LogLine, KvNamespace, KvEntry, Queue, DeadLetter,
+  Stats, StatsBucket, NodeInfo,
 } from "./types";
 
 export function decodeApps(v: JsonValue): AppSummary[] {
@@ -60,9 +61,11 @@ export function decodeRun(r: JsonValue): Run {
     error: strOr(r, "error", ""),
     startedAt: intOr(r, "started_at", 0),
     wallMs: optInt(r, "wall_ms"),
+    wallUs: optInt(r, "wall_us"),
     fuel: optInt(r, "fuel"),
     peakMemory: optInt(r, "peak_memory"),
     traceId: strOr(r, "trace_id", ""),
+    hostCalls: jsonText(member(r, "host_calls")),
   };
 }
 
@@ -134,4 +137,35 @@ export function decodeDead(v: JsonValue): DeadLetter[] {
       lastError: optStr(m, "last_error").unwrapOr(""),
     },
   );
+}
+
+function bucket(b: JsonValue): StatsBucket {
+  return StatsBucket {
+    t: intOr(b, "t", 0),
+    succeeded: intOr(b, "succeeded", 0),
+    failed: intOr(b, "failed", 0),
+    running: intOr(b, "running", 0),
+    p50: optInt(b, "p50_us"),
+    p95: optInt(b, "p95_us"),
+    logs: intOr(b, "logs", 0),
+  };
+}
+
+export function decodeStats(v: JsonValue): Stats {
+  return Stats {
+    since: intOr(v, "since", 0),
+    until: intOr(v, "until", 0),
+    bucketMs: intOr(v, "bucket_ms", 3600000),
+    buckets: items(member(v, "buckets")).map(b => bucket(b)),
+    totals: bucket(member(v, "totals")),
+  };
+}
+
+export function decodeNode(v: JsonValue): NodeInfo {
+  return NodeInfo {
+    version: strOr(v, "version", ""),
+    abi: intOr(v, "orbit_abi", 0),
+    kinds: items(member(v, "kinds")).map(k => asString(k).unwrapOr("")),
+    workers: items(member(v, "workers")).map(w => strOr(w, "app", "")),
+  };
 }

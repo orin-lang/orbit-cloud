@@ -28,8 +28,8 @@ function everyOptionIsRead(): void {
     "ctok",
     "--assets",
     "static",
-    "--client-js",
-    "x/orin-ui.js",
+    "--client-dir",
+    "x/client",
     "--workers",
     "8",
     "--quiet",
@@ -43,7 +43,7 @@ function everyOptionIsRead(): void {
   assertEqString(c.consoleToken, "c1", "console token");
   assertEqString(c.consoleTokenFile, "ctok", "console token file");
   assertEqString(c.assetsDir, "static", "assets");
-  assertEqString(c.clientJs, "x/orin-ui.js", "client");
+  assertEqString(c.clientDir, "x/client", "client");
   assertEq(c.workers, 8, "workers");
   assert(!c.accessLog, "quiet");
 }

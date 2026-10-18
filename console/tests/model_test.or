@@ -4,8 +4,15 @@ import { LogLine } from "../src/types";
 import {
   Model, Msg, LogState, Flash, initialModel, update, formField, filterFromForm, appendLines,
   maxLines, emptyLogs, LogsPage, Noop, ToggleFollow, FilterForm, ClearLines, LinesArrived,
-  StreamFailed, Notice, goodFlash, badFlash, noFlash,
+  StreamFailed, Notice, DismissFlash, goodFlash, badFlash, noFlash, OpenDialog, CloseDialog,
+  ConfirmDelete, ConfirmActivate, PublishDialog, PublishForm, ClearDraft, NoDialog, SortApps,
+  AppsPage, AppPage, ToggleRaw, ShowDiff, HideDiff, SelectKey, ShowKvEntries, HideKv, hasLiveLogs,
+  TabLogs, TabOverview,
 } from "../src/model";
+import { SortState } from "orin-ui";
+import { KvView, KvEntry } from "../src/types";
+import { RouteApp, RouteApps, RouteLogs } from "../src/effects";
+import { modelAfter } from "./support";
 
 function line(id: int, app: string): LogLine {
   return LogLine {
@@ -16,6 +23,10 @@ function line(id: int, app: string): LogLine {
     ts: id,
     runId: "",
   };
+}
+
+function fresh(): Model {
+  return initialModel(LogsPage, None, "node");
 }
 
 @Test
@@ -40,29 +51,63 @@ function theFilterFormIsTrimmedAndComplete(): void {
 
 @Test
 function noopChangesNothing(): void {
-  const m = initialModel(LogsPage);
-  const n = update(m, Noop);
+  const n = update(fresh(), Noop);
   assertEqString(n.flash.text, "", "flash");
   assertEq(n.logs.lines.length.toInt(), 0, "lines");
 }
 
 @Test
-function noticesReplaceTheFlash(): void {
-  let m = initialModel(LogsPage);
-  m = update(m, Notice(goodFlash("done", "/runs/x")));
+function noticesReplaceTheFlashAndCanBeDismissed(): void {
+  let m = update(fresh(), Notice(goodFlash("done", "/runs/x")));
   assertEqString(m.flash.text, "done", "text");
   assertEqString(m.flash.href, "/runs/x", "link");
   assert(!m.flash.bad, "good");
   m = update(m, Notice(badFlash("oops")));
   assert(m.flash.bad && m.flash.href.length == 0, "bad has no link");
-  m = update(m, Notice(noFlash()));
-  assertEqString(m.flash.text, "", "cleared");
+  m = update(m, DismissFlash);
+  assertEqString(m.flash.text, "", "dismissed");
+}
+
+@Test
+function dialogsOpenAndClose(): void {
+  let m = update(fresh(), OpenDialog(ConfirmDelete));
+  assert(
+    match (m.dialog) {
+      ConfirmDelete => true,
+      _ => false,
+    },
+    "open",
+  );
+  m = update(m, OpenDialog(ConfirmActivate(4)));
+  assert(
+    match (m.dialog) {
+      ConfirmActivate(id) => id == 4,
+      _ => false,
+    },
+    "another one replaces it",
+  );
+  m = update(m, CloseDialog);
+  assert(
+    match (m.dialog) {
+      NoDialog => true,
+      _ => false,
+    },
+    "closed",
+  );
+}
+
+@Test
+function thePublishDraftSurvivesAFailureAndClearsOnRequest(): void {
+  let m = update(fresh(), PublishForm("queue=+orders+&body=%7B%7D"));
+  assertEqString(m.draftQueue, "orders", "trimmed queue");
+  assertEqString(m.draftBody, "{}", "body");
+  m = update(m, ClearDraft);
+  assertEqString(m.draftQueue + m.draftBody, "", "cleared");
 }
 
 @Test
 function followingStartsFromAnEmptyLogAndStopsKeepingIt(): void {
-  let m = initialModel(LogsPage);
-  m = update(m, ToggleFollow);
+  let m = update(fresh(), ToggleFollow);
   assert(m.logs.following, "following");
   m = update(m, LinesArrived([line(1, "a"), line(2, "a")]));
   assertEq(m.logs.lines.length.toInt(), 2, "two lines");
@@ -77,8 +122,7 @@ function followingStartsFromAnEmptyLogAndStopsKeepingIt(): void {
 
 @Test
 function changingTheFilterRestartsTheLog(): void {
-  let m = initialModel(LogsPage);
-  m = update(m, ToggleFollow);
+  let m = update(fresh(), ToggleFollow);
   m = update(m, LinesArrived([line(5, "a")]));
   m = update(m, FilterForm("app=b&level=error&contains="));
   assertEqString(m.logs.filter.app, "b", "filter");
@@ -89,8 +133,7 @@ function changingTheFilterRestartsTheLog(): void {
 
 @Test
 function clearingKeepsTheCursorSoOldLinesDoNotComeBack(): void {
-  let m = initialModel(LogsPage);
-  m = update(m, LinesArrived([line(1, "a"), line(2, "a")]));
+  let m = update(fresh(), LinesArrived([line(1, "a"), line(2, "a")]));
   m = update(m, ClearLines);
   assertEq(m.logs.lines.length.toInt(), 0, "empty");
   assertEq(m.logs.lastId, 2, "cursor kept");
@@ -112,9 +155,105 @@ function theLogKeepsTheNewestLines(): void {
 
 @Test
 function aStreamErrorIsShownAndClearedByTheNextLines(): void {
-  let m = initialModel(LogsPage);
-  m = update(m, StreamFailed("orbitd is down"));
+  let m = update(fresh(), StreamFailed("orbitd is down"));
   assertEqString(m.logs.error, "orbitd is down", "error");
   m = update(m, LinesArrived([line(1, "a")]));
   assertEqString(m.logs.error, "", "cleared");
+}
+
+@Test
+function sortingTheAppsTableTogglesTheDirection(): void {
+  let m = modelAfter(RouteApps, []);
+  m = update(m, SortApps("name"));
+  const first = match (m.page) {
+    AppsPage(d) => d.sort,
+    _ => emptySort(),
+  };
+  assert(first.key == "name" && !first.desc, "ascending first");
+  m = update(m, SortApps("name"));
+  assert(
+    match (m.page) {
+      AppsPage(d) => d.sort.desc,
+      _ => false,
+    },
+    "then descending",
+  );
+  m = update(m, SortApps("runs"));
+  assert(
+    match (m.page) {
+      AppsPage(d) => d.sort.key == "runs" && !d.sort.desc,
+      _ => false,
+    },
+    "another column starts ascending",
+  );
+}
+
+function emptySort(): SortState {
+  return SortState { key: "", desc: false };
+}
+
+@Test
+function appPagesKeepTheirUiStateInTheModel(): void {
+  let m = modelAfter(RouteApp("hello", TabOverview, ""), []);
+  m = update(m, ToggleRaw);
+  assert(
+    match (m.page) {
+      AppPage(v) => v.showRaw,
+      _ => false,
+    },
+    "raw JSON on",
+  );
+  m = update(m, ShowDiff(2));
+  assert(
+    match (m.page) {
+      AppPage(v) => v.diff.isSome(),
+      _ => false,
+    },
+    "diff shown",
+  );
+  m = update(m, HideDiff);
+  assert(
+    match (m.page) {
+      AppPage(v) => v.diff.isNone(),
+      _ => false,
+    },
+    "diff hidden",
+  );
+  m = update(
+    m,
+    ShowKvEntries(KvView {
+      namespace: "cfg",
+      entries: [KvEntry { key: "a", value: "1", size: 1 }],
+    }),
+  );
+  m = update(m, SelectKey("a"));
+  assert(
+    match (m.page) {
+      AppPage(v) => v.selectedKey == "a" && v.kv.isSome(),
+      _ => false,
+    },
+    "a key selected",
+  );
+  m = update(m, HideKv);
+  assert(
+    match (m.page) {
+      AppPage(v) => v.kv.isNone() && v.selectedKey == "",
+      _ => false,
+    },
+    "kv closed",
+  );
+  // the same messages on another page change nothing
+  const other = update(fresh(), ToggleRaw);
+  assertEqString(other.flash.text, "", "ignored");
+}
+
+@Test
+function onlyTheLogPagesStreamLiveLines(): void {
+  assert(hasLiveLogs(LogsPage), "the logs page");
+  assert(hasLiveLogs(modelAfter(RouteApp("hello", TabLogs, ""), []).page), "an app's logs tab");
+  assert(
+    !hasLiveLogs(modelAfter(RouteApp("hello", TabOverview, ""), []).page),
+    "an app's overview",
+  );
+  assert(!hasLiveLogs(modelAfter(RouteApps, []).page), "the apps list");
 }
