@@ -3,6 +3,7 @@
 //! connection sits behind a mutex, so callers on an async runtime may call it directly or from `spawn_blocking`.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,7 +12,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const SCHEMA: &str = include_str!("schema.sql");
+const MIGRATE_V2: &str = include_str!("migrate_v2.sql");
 const SCHEMA_VERSION: &str = "1";
+
+mod platform;
+pub use platform::*;
 
 /// A store error. SQLite errors are wrapped; `NotFound` and `Conflict` are the expected outcomes callers branch on.
 #[derive(Debug, thiserror::Error)]
@@ -63,11 +68,44 @@ pub fn valid_name(name: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 
+/// Whether `key` is a valid app or queue key: a name, or `project.name` (two names joined by a dot). The key of a
+/// thing in the `default` project is the bare name; see `docs/platform.md`.
+#[must_use]
+pub fn valid_key(key: &str) -> bool {
+    match key.split_once('.') {
+        Some((p, n)) => valid_name(p) && valid_name(n),
+        None => valid_name(key),
+    }
+}
+
+/// The key of `name` in `project` (the bare name for the `default` project).
+#[must_use]
+pub fn key_of(project: &str, name: &str) -> String {
+    if project == DEFAULT_PROJECT {
+        name.to_owned()
+    } else {
+        format!("{project}.{name}")
+    }
+}
+
+/// Splits a key into project and name.
+#[must_use]
+pub fn split_key(key: &str) -> (&str, &str) {
+    key.split_once('.').unwrap_or((DEFAULT_PROJECT, key))
+}
+
+/// The name of the project (and organisation) that existed before projects did.
+pub const DEFAULT_PROJECT: &str = "default";
+
 /// An app and its active deployment.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct App {
-    /// The app name (also its Orbit tenant).
+    /// The app key (also its Orbit tenant): the bare name in the `default` project, `project.name` elsewhere.
     pub name: String,
+    /// The project.
+    pub project: String,
+    /// The name inside the project.
+    pub short: String,
     /// Creation time.
     pub created_at: i64,
     /// The active deployment, if any.
@@ -192,6 +230,9 @@ pub struct LogQuery {
     pub since: Option<i64>,
     /// Lines whose text contains this.
     pub contains: Option<String>,
+    /// Only apps of this project (set by the server, not by clients).
+    #[serde(skip)]
+    pub project: Option<String>,
     /// At most this many (default 200, at most 5000).
     pub limit: Option<i64>,
 }
@@ -275,6 +316,8 @@ pub enum NackOutcome {
 /// The database.
 pub struct Store {
     conn: Mutex<Connection>,
+    /// Bumped by every change the gateway cares about (projects, apps, routes, domains, ports).
+    generation: AtomicU64,
 }
 
 impl std::fmt::Debug for Store {
@@ -349,6 +392,30 @@ fn log_from_row(r: &Row<'_>) -> rusqlite::Result<LogLine> {
     })
 }
 
+const APP_SELECT: &str = "SELECT a.name, a.created_at, a.active_deployment, COALESCE(p.name, 'default'), COALESCE(a.short, a.name)
+     FROM apps a LEFT JOIN projects p ON p.id = a.project_id";
+
+fn app_from_row(r: &Row<'_>) -> rusqlite::Result<App> {
+    Ok(App {
+        name: r.get(0)?,
+        created_at: r.get(1)?,
+        active_deployment: r.get(2)?,
+        project: r.get(3)?,
+        short: r.get(4)?,
+    })
+}
+
+/// The id of project `name`.
+fn project_id(db: &Connection, name: &str) -> Result<String> {
+    db.query_row(
+        "SELECT id FROM projects WHERE name = ?1",
+        params![name],
+        |r| r.get(0),
+    )
+    .optional()?
+    .ok_or_else(|| StoreError::NotFound(format!("project `{name}`")))
+}
+
 impl Store {
     /// Opens (and creates or migrates) the database at `path`.
     ///
@@ -377,9 +444,28 @@ impl Store {
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION],
         )?;
+        let version: String = conn.query_row(
+            "SELECT value FROM meta WHERE key = 'schema_version'",
+            [],
+            |r| r.get(0),
+        )?;
+        if version == "1" {
+            conn.execute_batch(MIGRATE_V2)?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
+            generation: AtomicU64::new(1),
         })
+    }
+
+    /// A counter that changes whenever projects, apps, routes, domains or ports change.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    fn bump(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     fn db(&self) -> MutexGuard<'_, Connection> {
@@ -405,89 +491,94 @@ impl Store {
 
     // ------------------------------------------------------------------------------------------------ apps
 
-    /// Creates an app.
+    /// Creates an app by key.
     ///
     /// # Errors
-    /// [`StoreError::Conflict`] for a bad or taken name.
-    pub fn create_app(&self, name: &str) -> Result<App> {
-        if !valid_name(name) {
+    /// [`StoreError::Conflict`] for a bad or taken key, [`StoreError::NotFound`] for an unknown project.
+    pub fn create_app(&self, key: &str) -> Result<App> {
+        if !valid_key(key) {
             return Err(StoreError::Conflict(format!(
-                "invalid app name `{name}`: 1-63 of a-z, 0-9 and -, not starting with -"
+                "invalid app name `{key}`: 1-63 of a-z, 0-9 and -, not starting with -"
             )));
         }
+        let (project, short) = split_key(key);
         let now = now_ms();
-        let n = self.db().execute(
-            "INSERT OR IGNORE INTO apps (name, created_at) VALUES (?1, ?2)",
-            params![name, now],
-        )?;
+        let n = {
+            let db = self.db();
+            let pid = project_id(&db, project)?;
+            db.execute(
+                "INSERT OR IGNORE INTO apps (name, created_at, project_id, short) VALUES (?1, ?2, ?3, ?4)",
+                params![key, now, pid, short],
+            )?
+        };
         if n == 0 {
-            return Err(StoreError::Conflict(format!("app `{name}` exists")));
+            return Err(StoreError::Conflict(format!("app `{key}` exists")));
         }
-        Ok(App {
-            name: name.to_owned(),
-            created_at: now,
-            active_deployment: None,
-        })
+        self.bump();
+        self.app(key)
     }
 
-    /// The app `name`.
+    /// The app with key `key`.
     ///
     /// # Errors
     /// [`StoreError::NotFound`].
-    pub fn app(&self, name: &str) -> Result<App> {
+    pub fn app(&self, key: &str) -> Result<App> {
         self.db()
             .query_row(
-                "SELECT name, created_at, active_deployment FROM apps WHERE name = ?1",
-                params![name],
-                |r| {
-                    Ok(App {
-                        name: r.get(0)?,
-                        created_at: r.get(1)?,
-                        active_deployment: r.get(2)?,
-                    })
-                },
+                &format!("{APP_SELECT} WHERE a.name = ?1"),
+                params![key],
+                app_from_row,
             )
             .optional()?
-            .ok_or_else(|| StoreError::NotFound(format!("app `{name}`")))
+            .ok_or_else(|| StoreError::NotFound(format!("app `{key}`")))
     }
 
-    /// All apps by name.
+    /// All apps by key.
     ///
     /// # Errors
     /// [`StoreError::Db`].
     pub fn apps(&self) -> Result<Vec<App>> {
         let db = self.db();
-        let mut st =
-            db.prepare("SELECT name, created_at, active_deployment FROM apps ORDER BY name")?;
-        let rows = st.query_map([], |r| {
-            Ok(App {
-                name: r.get(0)?,
-                created_at: r.get(1)?,
-                active_deployment: r.get(2)?,
-            })
-        })?;
+        let mut st = db.prepare(&format!("{APP_SELECT} ORDER BY a.name"))?;
+        let rows = st.query_map([], app_from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Deletes an app with its deployments, runs, logs, spans and KV data. Modules stay (content-addressed, shared).
+    /// The apps of one project, by name.
+    ///
+    /// # Errors
+    /// [`StoreError::Db`].
+    pub fn apps_in(&self, project: &str) -> Result<Vec<App>> {
+        let db = self.db();
+        let mut st = db.prepare(&format!("{APP_SELECT} WHERE p.name = ?1 ORDER BY a.short"))?;
+        let rows = st.query_map(params![project], app_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Deletes an app with its deployments, runs, logs, spans, routes and KV data. Modules stay (content-addressed,
+    /// shared).
     ///
     /// # Errors
     /// [`StoreError::NotFound`].
-    pub fn delete_app(&self, name: &str) -> Result<()> {
+    pub fn delete_app(&self, key: &str) -> Result<()> {
         let mut db = self.db();
         let tx = db.transaction()?;
-        let n = tx.execute("DELETE FROM apps WHERE name = ?1", params![name])?;
+        let n = tx.execute("DELETE FROM apps WHERE name = ?1", params![key])?;
         if n == 0 {
-            return Err(StoreError::NotFound(format!("app `{name}`")));
+            return Err(StoreError::NotFound(format!("app `{key}`")));
         }
         tx.execute(
             "DELETE FROM spans WHERE run_id IN (SELECT id FROM runs WHERE app = ?1)",
-            params![name],
+            params![key],
         )?;
-        tx.execute("DELETE FROM runs WHERE app = ?1", params![name])?;
-        tx.execute("DELETE FROM logs WHERE app = ?1", params![name])?;
-        tx.execute("DELETE FROM kv WHERE tenant = ?1", params![name])?;
+        tx.execute("DELETE FROM runs WHERE app = ?1", params![key])?;
+        tx.execute("DELETE FROM logs WHERE app = ?1", params![key])?;
+        tx.execute("DELETE FROM kv WHERE tenant = ?1", params![key])?;
+        tx.execute("DELETE FROM routes WHERE app = ?1", params![key])?;
+        tx.execute("DELETE FROM app_ports WHERE app = ?1", params![key])?;
         tx.commit()?;
+        drop(db);
+        self.bump();
         Ok(())
     }
 
@@ -528,11 +619,13 @@ impl Store {
     /// # Errors
     /// [`StoreError::NotFound`] when the module is unknown, [`StoreError::Conflict`] for a bad app name.
     pub fn deploy(&self, app: &str, module: &str, spec: &serde_json::Value) -> Result<Deployment> {
-        if !valid_name(app) {
+        if !valid_key(app) {
             return Err(StoreError::Conflict(format!("invalid app name `{app}`")));
         }
+        let (project, short) = split_key(app);
         let now = now_ms();
         let mut db = self.db();
+        let pid = project_id(&db, project)?;
         let tx = db.transaction()?;
         let known: bool = tx
             .query_row(
@@ -545,9 +638,9 @@ impl Store {
         if !known {
             return Err(StoreError::NotFound(format!("module {module}")));
         }
-        tx.execute(
-            "INSERT OR IGNORE INTO apps (name, created_at) VALUES (?1, ?2)",
-            params![app, now],
+        let created = tx.execute(
+            "INSERT OR IGNORE INTO apps (name, created_at, project_id, short) VALUES (?1, ?2, ?3, ?4)",
+            params![app, now, pid, short],
         )?;
         let version: i64 = tx.query_row(
             "SELECT COALESCE(MAX(version), 0) + 1 FROM deployments WHERE app = ?1",
@@ -564,6 +657,10 @@ impl Store {
             params![id, app],
         )?;
         tx.commit()?;
+        drop(db);
+        if created > 0 {
+            self.bump();
+        }
         Ok(Deployment {
             id,
             app: app.to_owned(),
@@ -716,6 +813,21 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Runs of the apps of `project`, newest first; at most `limit` (1..=1000).
+    ///
+    /// # Errors
+    /// [`StoreError::Db`].
+    pub fn runs_in(&self, project: &str, limit: i64) -> Result<Vec<Run>> {
+        let limit = limit.clamp(1, 1000);
+        let db = self.db();
+        let mut st = db.prepare(
+            "SELECT * FROM runs WHERE app IN (SELECT a.name FROM apps a JOIN projects p ON p.id = a.project_id WHERE p.name = ?1)
+             ORDER BY started_at DESC, rowid DESC LIMIT ?2",
+        )?;
+        let rows = st.query_map(params![project, limit], run_from_row)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Counts of runs by app and status (for metrics).
     ///
     /// # Errors
@@ -762,10 +874,13 @@ impl Store {
             "SELECT * FROM (SELECT * FROM logs WHERE (?1 IS NULL OR app = ?1) AND (?2 IS NULL OR run_id = ?2)
                AND (?3 IS NULL OR level = ?3) AND (?4 IS NULL OR id > ?4) AND (?5 IS NULL OR ts >= ?5)
                AND (?6 IS NULL OR instr(message, ?6) > 0)
+               AND (?8 IS NULL OR app IN (SELECT a.name FROM apps a JOIN projects p ON p.id = a.project_id WHERE p.name = ?8))
              ORDER BY id DESC LIMIT ?7) ORDER BY id ASC",
         )?;
         let rows = st.query_map(
-            params![q.app, q.run, q.level, q.after, q.since, q.contains, limit],
+            params![
+                q.app, q.run, q.level, q.after, q.since, q.contains, limit, q.project
+            ],
             log_from_row,
         )?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -948,7 +1063,7 @@ impl Store {
     /// # Errors
     /// [`StoreError::Conflict`] for a bad queue name.
     pub fn enqueue(&self, queue: &str, body: &[u8]) -> Result<i64> {
-        if !valid_name(queue) {
+        if !valid_key(queue) {
             return Err(StoreError::Conflict(format!(
                 "invalid queue name `{queue}`"
             )));
