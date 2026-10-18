@@ -104,6 +104,7 @@ pub fn router(state: AppState) -> Router {
         .route("/queues/{q}/messages/{id}/nack", post(nack))
         .route("/queues/{q}/dead", get(dead_letters))
         .route("/queues/{q}/redrive", post(redrive))
+        .route("/stats", get(stats))
         .route("/node", get(node_info))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
         .layer(axum::extract::DefaultBodyLimit::max(MAX_MODULE_BYTES));
@@ -345,6 +346,33 @@ async fn all_runs(State(s): State<AppState>, Query(l): Query<Limit>) -> ApiResul
     Ok(Json(json!(
         s.node.executor.store().runs(None, l.limit.unwrap_or(50))?
     )))
+}
+
+#[derive(Deserialize, Default)]
+struct StatsParams {
+    since: Option<i64>,
+    until: Option<i64>,
+    bucket: Option<i64>,
+    app: Option<String>,
+}
+
+/// `GET /v1/stats`: run counts by status, run-time percentiles and log counts per time bucket.
+async fn stats(State(s): State<AppState>, Query(p): Query<StatsParams>) -> ApiResult<Json<Value>> {
+    // `until` is exclusive; the default includes runs started in the current millisecond.
+    let until = p.until.unwrap_or_else(|| oc_store::now_ms() + 1);
+    let bucket = p.bucket.unwrap_or(3_600_000);
+    let since = p.since.unwrap_or(until - 24 * 3_600_000);
+    if until <= since || bucket < 1000 || (until - since + bucket - 1) / bucket > 1000 {
+        return Err(ApiError::bad(
+            "stats needs since < until, bucket of at least 1000 ms and at most 1000 buckets in the range",
+        ));
+    }
+    let st = s
+        .node
+        .executor
+        .store()
+        .stats(since, until, bucket, p.app.as_deref())?;
+    Ok(Json(json!(st)))
 }
 
 async fn get_run(State(s): State<AppState>, Path(id): Path<String>) -> ApiResult<Json<Value>> {

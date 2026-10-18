@@ -1,0 +1,8 @@
+[package]
+name = "orbit-console"
+version = "0.1.0"
+entry = "src/main.or"
+
+[dependencies]
+orin-ui = { git = "https://github.com/orin-lang/orin-ui", rev = "9cddc173b706b1797a448d1e4cf07f5357b8a4b3" }
+orin-web = { git = "https://github.com/orin-lang/orin-web", rev = "fb8ef8b3cddd2414c54467de515a0330f1a3f9a6" }

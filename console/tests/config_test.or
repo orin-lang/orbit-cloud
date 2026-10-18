@@ -1,0 +1,67 @@
+import { assert, assertEq, assertEqString } from "std:test";
+import { parseArgs, defaultConfig, splitHostPort } from "../src/config";
+
+@Test
+function defaultsPointAtALocalOrbitd(): void {
+  const c = parseArgs([]).unwrap();
+  assertEqString(c.listenAddress, "127.0.0.1", "listen address");
+  assertEq(c.listenPort, 8081, "listen port");
+  assertEqString(c.apiHost, "127.0.0.1", "api host");
+  assertEq(c.apiPort, 8080, "api port");
+  assert(c.accessLog, "access log on");
+}
+
+@Test
+function everyOptionIsRead(): void {
+  const c = parseArgs([
+    "--listen",
+    "0.0.0.0:9000",
+    "--api",
+    "http://orbitd.internal:8080/ignored",
+    "--api-token",
+    "t1",
+    "--api-token-file",
+    "tok",
+    "--console-token",
+    "c1",
+    "--console-token-file",
+    "ctok",
+    "--assets",
+    "static",
+    "--client-dir",
+    "x/client",
+    "--workers",
+    "8",
+    "--quiet",
+  ]).unwrap();
+  assertEqString(c.listenAddress, "0.0.0.0", "listen address");
+  assertEq(c.listenPort, 9000, "listen port");
+  assertEqString(c.apiHost, "orbitd.internal", "host without scheme and path");
+  assertEq(c.apiPort, 8080, "port");
+  assertEqString(c.apiToken, "t1", "api token");
+  assertEqString(c.apiTokenFile, "tok", "api token file");
+  assertEqString(c.consoleToken, "c1", "console token");
+  assertEqString(c.consoleTokenFile, "ctok", "console token file");
+  assertEqString(c.assetsDir, "static", "assets");
+  assertEqString(c.clientDir, "x/client", "client");
+  assertEq(c.workers, 8, "workers");
+  assert(!c.accessLog, "quiet");
+}
+
+@Test
+function badOptionsAreRefusedWithAReason(): void {
+  assert(parseArgs(["--listen"]).unwrapErr().includes("needs a value"), "missing value");
+  assert(parseArgs(["--bogus", "x"]).unwrapErr().includes("unknown option"), "unknown");
+  assert(parseArgs(["--listen", "nonsense"]).isErr(), "no port");
+  assert(parseArgs(["--listen", "h:70000"]).isErr(), "port range");
+  assert(parseArgs(["--api", "https://x:1"]).unwrapErr().includes("https"), "https");
+  assert(parseArgs(["--workers", "0"]).isErr(), "workers range");
+}
+
+@Test
+function hostAndPortSplitAtTheLastColon(): void {
+  const hp = splitHostPort("[::1]:8080").unwrap();
+  assertEqString(hp[0], "[::1]", "ipv6 host");
+  assertEqString(hp[1], "8080", "port");
+  assert(splitHostPort(":80").isErr(), "empty host");
+}

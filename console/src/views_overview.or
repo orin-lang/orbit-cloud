@@ -1,0 +1,341 @@
+// The overview: the state of the node at a glance.
+import {
+  Node, el, text, cls, href, attr, nothing, PageHeader, Grid, Card, FlushCard, Stack, StatCard,
+  BarChart, LineChart, ChartSpec, series, Table, column, tableRow, TableRow, unsorted, EmptyState,
+  StatusPill, Badge, ToneSuccess, ToneDanger, ToneWarning, ToneNeutral, ToneInfo, Tone, Button,
+  ButtonSecondary, ButtonPrimary, LinkButton, IconLabelButton, compactNumber, Inline, Sparkline,
+  Mono,
+} from "orin-ui";
+import { Stats, StatsBucket, Queue, Run, AppSummary } from "./types";
+import { Model, Msg, OverviewData, Refresh } from "./model";
+import { hourMinute, duration, ratePercent, ago, dateTime, clip } from "./fmt";
+import { appHref, runHref, noop, RunDuration } from "./views_common";
+
+function total(b: StatsBucket): int {
+  return b.succeeded + b.failed + b.running;
+}
+
+// "+12%", "-8%", "new" or "" for a change from `before` to `now`.
+export function delta(now: int, before: int): string {
+  if (before <= 0) {
+    return now > 0 ? "new" : "";
+  }
+  const pct = (now - before) * 100 / before;
+  return (pct > 0 ? "+" : "") + pct.toString() + "%";
+}
+
+function trendTone(now: int, before: int, upIsBad: bool): Tone {
+  if (now == before || before <= 0) {
+    return ToneNeutral;
+  }
+  const up = now > before;
+  return up == upIsBad ? ToneDanger : ToneSuccess;
+}
+
+function p95Series(s: Stats): int[] {
+  return s.buckets.map(b => b.p95.unwrapOr(0));
+}
+
+function labelsOf(s: Stats): string[] {
+  return s.buckets.map(b => hourMinute(b.t));
+}
+
+function ticksOf(s: Stats): string[] {
+  let out: string[] = [];
+  let i: usize = 0;
+  while (i < s.buckets.length) {
+    out.push(i % 4 == 0 ? hourMinute(s.buckets[i].t) : "");
+    i += 1;
+  }
+  return out;
+}
+
+// Axis labels for run times: round numbers, "20 ms" rather than "20.0 ms".
+export function durationAxis(us: int): string {
+  if (us == 0) {
+    return "0";
+  }
+  if (us >= 1000000 && us % 1000000 == 0) {
+    return (us / 1000000).toString() + " s";
+  }
+  if (us >= 1000 && us % 1000 == 0) {
+    return (us / 1000).toString() + " ms";
+  }
+  return duration(us);
+}
+
+function fmtCount(v: int): string {
+  return compactNumber(v);
+}
+
+function kindCount(apps: AppSummary[], kind: string): int {
+  let n: int = 0;
+  for (const a of apps) {
+    if (a.kind == kind) {
+      n += 1;
+    }
+  }
+  return n;
+}
+
+function backlog(qs: Queue[]): int {
+  let n: int = 0;
+  for (const q of qs) {
+    n += q.ready + q.leased;
+  }
+  return n;
+}
+
+function deadTotal(qs: Queue[]): int {
+  let n: int = 0;
+  for (const q of qs) {
+    n += q.dead;
+  }
+  return n;
+}
+
+function AttentionRow(q: Queue): TableRow<Msg> {
+  return tableRow<Msg>(
+    q.queue,
+    [
+      el<Msg>("a", [href<Msg>("/queues")], [text<Msg>(q.queue)]),
+      q.dead > 0
+          ? Badge<Msg>(q.dead.toString() + " dead", ToneDanger)
+          : Badge<Msg>("ok", ToneSuccess),
+      text<Msg>(q.ready.toString()),
+      text<Msg>(q.leased.toString()),
+    ],
+  );
+}
+
+function FailedRow(r: Run, now: int): TableRow<Msg> {
+  return tableRow<Msg>(
+    r.id,
+    [
+      el<Msg>("a", [href<Msg>(runHref(r.id)), cls<Msg>("ou-mono")], [text<Msg>(r.id)]),
+      el<Msg>("a", [href<Msg>(appHref(r.app))], [text<Msg>(r.app)]),
+      el<Msg>("span", [cls<Msg>("ou-muted")], [text<Msg>(ago(now, r.startedAt))]),
+      el<Msg>(
+        "span",
+        [cls<Msg>("ou-faint")],
+        [
+          text<Msg>(
+            r.error.length > 0
+                ? clip(r.error, 48)
+                : "exit " + (r.exitCode.isSome() ? r.exitCode.unwrap().toString() : "?"),
+          ),
+        ],
+      ),
+    ],
+  );
+}
+
+export function OverviewView(m: Model, d: OverviewData): Node<Msg> {
+  const t = d.stats.totals;
+  const p = d.previous.totals;
+  const runs = total(t);
+  const prevRuns = total(p);
+  const finished = t.succeeded + t.failed;
+  const errPct = finished > 0 ? t.failed * 1000 / finished : 0;
+  const prevFinished = p.succeeded + p.failed;
+  const prevErrPct = prevFinished > 0 ? p.failed * 1000 / prevFinished : 0;
+  const dead = deadTotal(d.queues);
+  const kinds = kindCount(d.apps, "job").toString() + " jobs, "
+      + kindCount(d.apps, "service").toString() + " services, "
+      + kindCount(d.apps, "consumer").toString() + " consumers";
+  const attention = d.queues.filter(q => q.dead > 0 || q.ready > 0);
+  const runSpec = ChartSpec {
+    title: "Runs per hour",
+    labels: labelsOf(d.stats),
+    ticks: ticksOf(d.stats),
+    series: [
+      series("succeeded", 0, d.stats.buckets.map(b => b.succeeded)),
+      series("failed", 1, d.stats.buckets.map(b => b.failed)),
+    ],
+    height: 220,
+    yFormat: fmtCount,
+    yMax: 0,
+    unit: "runs",
+    empty: "No runs in the last 24 hours",
+  };
+  const durSpec = ChartSpec {
+    title: "Run time per hour",
+    labels: labelsOf(d.stats),
+    ticks: ticksOf(d.stats),
+    series: [
+      series("p50", 0, d.stats.buckets.map(b => b.p50.unwrapOr(0))),
+      series("p95", 3, p95Series(d.stats)),
+    ],
+    height: 220,
+    yFormat: durationAxis,
+    yMax: 0,
+    unit: "",
+    empty: "No finished runs in the last 24 hours",
+  };
+  return Stack<Msg>([
+    PageHeader<Msg>(
+      "Overview",
+      "The last 24 hours on " + m.nodeLabel,
+      [],
+      [IconLabelButton<Msg>("refresh", "Refresh", ButtonSecondary, Refresh)],
+    ),
+    Grid<Msg>(
+      4,
+      [
+        StatCard<Msg>("Apps", d.apps.length.toString(), "", ToneNeutral, [], kinds),
+        StatCard<Msg>(
+          "Runs, last 24 h",
+          compactNumber(runs),
+          delta(runs, prevRuns),
+          ToneNeutral,
+          d.stats.buckets.map(b => total(b)),
+          "vs. the 24 h before",
+        ),
+        StatCard<Msg>(
+          "Error rate",
+          ratePercent(t.failed, finished),
+          delta(errPct, prevErrPct),
+          trendTone(errPct, prevErrPct, true),
+          d.stats.buckets.map(b => b.failed),
+          t.failed.toString() + " failed",
+        ),
+        StatCard<Msg>(
+          "p95 run time",
+          t.p95.isSome() ? duration(t.p95.unwrap()) : "-",
+          t.p50.isSome() ? "p50 " + duration(t.p50.unwrap()) : "",
+          ToneNeutral,
+          p95Series(d.stats),
+          "",
+        ),
+        StatCard<Msg>(
+          "Queue backlog",
+          compactNumber(backlog(d.queues)),
+          "",
+          ToneNeutral,
+          [],
+          d.queues.length.toString() + " queues",
+        ),
+        StatCard<Msg>(
+          "Dead letters",
+          dead.toString(),
+          dead > 0 ? "needs attention" : "",
+          dead > 0 ? ToneDanger : ToneNeutral,
+          [],
+          dead > 0 ? "redrive on Queues" : "none",
+        ),
+        StatCard<Msg>(
+          "Active workers",
+          d.workers.toString(),
+          "",
+          ToneNeutral,
+          [],
+          "services and consumers",
+        ),
+        StatCard<Msg>(
+          "Log lines, last 24 h",
+          compactNumber(t.logs),
+          "",
+          ToneNeutral,
+          d.stats.buckets.map(b => b.logs),
+          "",
+        ),
+      ],
+    ),
+    Grid<Msg>(
+      2,
+      [
+        Card<Msg>("Runs over time", [Badge<Msg>("hourly", ToneNeutral)], [BarChart<Msg>(runSpec)]),
+        Card<Msg>(
+          "Run duration",
+          [Badge<Msg>("p50 and p95", ToneNeutral)],
+          [LineChart<Msg>(durSpec, false)],
+        ),
+      ],
+    ),
+    Grid<Msg>(
+      2,
+      [
+        FlushCard<Msg>(
+          "Latest failed runs",
+          [el<Msg>("a", [href<Msg>("/runs")], [text<Msg>("All runs")])],
+          [
+            Table<Msg>(
+              [
+                column("id", "Run"),
+                column("app", "App"),
+                column("when", "When"),
+                column("why", "Reason"),
+              ],
+              d.failed.map(r => FailedRow(r, d.stats.until)),
+              unsorted(),
+              noop,
+              EmptyState<Msg>(
+                "check",
+                "No failed runs",
+                "Nothing failed among the latest 100 runs.",
+                [],
+              ),
+            ),
+          ],
+        ),
+        FlushCard<Msg>(
+          "Queues needing attention",
+          [el<Msg>("a", [href<Msg>("/queues")], [text<Msg>("All queues")])],
+          [
+            Table<Msg>(
+              [
+                column("q", "Queue"),
+                column("state", "State"),
+                column("ready", "Ready"),
+                column("leased", "Leased"),
+              ],
+              attention.map(q => AttentionRow(q)),
+              unsorted(),
+              noop,
+              EmptyState<Msg>(
+                "check",
+                "All queues are healthy",
+                "No dead letters and nothing waiting.",
+                [],
+              ),
+            ),
+          ],
+        ),
+      ],
+    ),
+    FlushCard<Msg>(
+      "Latest runs",
+      [],
+      [
+        Table<Msg>(
+          [
+            column("id", "Run"),
+            column("app", "App"),
+            column("status", "Status"),
+            column("time", "Duration"),
+            column("when", "When"),
+          ],
+          d.latest.map(
+            r => tableRow<Msg>(
+              r.id,
+              [
+                el<Msg>("a", [href<Msg>(runHref(r.id)), cls<Msg>("ou-mono")], [text<Msg>(r.id)]),
+                el<Msg>("a", [href<Msg>(appHref(r.app))], [text<Msg>(r.app)]),
+                StatusPill<Msg>(r.status),
+                text<Msg>(RunDuration(r)),
+                el<Msg>(
+                  "span",
+                  [cls<Msg>("ou-muted")],
+                  [text<Msg>(ago(d.stats.until, r.startedAt))],
+                ),
+              ],
+            ),
+          ),
+          unsorted(),
+          noop,
+          EmptyState<Msg>("runs", "No runs yet", "Deploy an app and run it: occtl run NAME.", []),
+        ),
+      ],
+    ),
+  ]);
+}

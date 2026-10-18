@@ -1,0 +1,12 @@
+// The console's orin-ui program: `init` is only a placeholder, every session starts from the model of the page it was opened on.
+import { Program } from "orin-ui";
+import { Model, Msg, initialModel, update, NoticePage } from "./model";
+import { view } from "./views";
+
+export function program(): Program<Model, Msg> {
+  return Program<Model, Msg> {
+    init: initialModel(NoticePage("", "", false), None, ""),
+    update: update,
+    view: view,
+  };
+}

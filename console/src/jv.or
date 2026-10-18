@@ -1,0 +1,101 @@
+// Tolerant accessors over std:json values. The console reads the API's answers for display, so a missing or oddly typed field
+// is shown as empty instead of failing the page (the strict decoders of std:json/decode are for input that must be exact).
+import {
+  JsonValue, JsonMember, ValueNull, ValueBool, ValueNumber, ValueString, ValueArray, ValueObject,
+  parseDocument, writeDocument, defaultReadOptions, defaultLimits,
+} from "std:json";
+import { numberAsInt } from "std:json/number";
+
+export function parseJson(text: string): Option<JsonValue> {
+  const r = parseDocument(text, defaultReadOptions());
+  if (r.isErr()) {
+    return None;
+  }
+  return Some(r.unwrap());
+}
+
+// The compact text of a value ("" if it cannot be written).
+export function jsonText(v: JsonValue): string {
+  const r = writeDocument(v, defaultLimits());
+  return r.isOk() ? r.unwrap() : "";
+}
+
+export function field(v: JsonValue, key: string): Option<JsonValue> {
+  return match (v) {
+    ValueObject(members) => {
+      for (const m of members) {
+        if (m.key == key) {
+          return Some(m.value);
+        }
+      }
+      return None;
+    },
+    _ => None,
+  };
+}
+
+export function member(v: JsonValue, key: string): JsonValue {
+  const f = field(v, key);
+  return f.isSome() ? f.unwrap() : ValueNull;
+}
+
+export function asString(v: JsonValue): Option<string> {
+  return match (v) {
+    ValueString(s) => Some(s),
+    _ => None,
+  };
+}
+
+export function asInt(v: JsonValue): Option<int> {
+  return match (v) {
+    ValueNumber(n) => {
+      const r = numberAsInt(n);
+      return r.isOk() ? Some(r.unwrap()) : None;
+    },
+    _ => None,
+  };
+}
+
+export function asBool(v: JsonValue): Option<bool> {
+  return match (v) {
+    ValueBool(b) => Some(b),
+    _ => None,
+  };
+}
+
+export function items(v: JsonValue): JsonValue[] {
+  return match (v) {
+    ValueArray(xs) => xs,
+    _ => [],
+  };
+}
+
+export function strOr(v: JsonValue, key: string, fallback: string): string {
+  return asString(member(v, key)).unwrapOr(fallback);
+}
+
+export function intOr(v: JsonValue, key: string, fallback: int): int {
+  return asInt(member(v, key)).unwrapOr(fallback);
+}
+
+export function boolOr(v: JsonValue, key: string, fallback: bool): bool {
+  return asBool(member(v, key)).unwrapOr(fallback);
+}
+
+// None for an absent field and for null.
+export function optStr(v: JsonValue, key: string): Option<string> {
+  return asString(member(v, key));
+}
+
+export function optInt(v: JsonValue, key: string): Option<int> {
+  return asInt(member(v, key));
+}
+
+// The error text of an API error body: {"error": "..."}.
+export function errorText(body: string): string {
+  const j = parseJson(body);
+  if (j.isNone()) {
+    return body.length > 200 ? body.substring(0, 200) : body;
+  }
+  return strOr(j.unwrap(), "error", "");
+}

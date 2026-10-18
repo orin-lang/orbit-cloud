@@ -1,0 +1,185 @@
+// The API layer: paths, error mapping and the tolerant decoders.
+import { assert, assertEq, assertEqString } from "std:test";
+import {
+  Api, ApiRequest, ApiResponse, seg, query, call, listApps, getApp, getRun, runTrace, logsAfter,
+  runNow, stats, nodeInfo,
+} from "../src/api";
+import { JsonValue } from "std:json";
+import { parseJson } from "../src/jv";
+import {
+  decodeRun, decodeApps, decodeAppDetail, decodeSpans, decodeLogs, decodeQueues, decodeDead,
+} from "../src/decode";
+import { fakeApi, status } from "./support";
+
+function constant(code: int, body: string): Api {
+  return (req: ApiRequest): Result<ApiResponse, string> => Ok(status(code, body));
+}
+
+function json(text: string): JsonValue {
+  return parseJson(text).unwrap();
+}
+
+@Test
+function segmentsAreEscapedForPaths(): void {
+  assertEqString(seg("hello"), "hello", "plain");
+  assertEqString(seg("a b/c?d"), "a%20b%2Fc%3Fd", "reserved characters");
+  assertEqString(seg("é"), "%C3%A9", "utf-8");
+}
+
+@Test
+function queriesSkipEmptyValues(): void {
+  assertEqString(query(["a", "b"], ["1", "2"]), "?a=1&b=2", "both");
+  assertEqString(query(["a", "b"], ["", "2"]), "?b=2", "first empty");
+  assertEqString(query(["a"], [""]), "", "none");
+  assertEqString(query(["q"], ["x y&z"]), "?q=x%20y%26z", "escaped");
+}
+
+@Test
+function errorsKeepTheStatusAndTheMessageOfOrbitd(): void {
+  const r = call(constant(404, "{\"error\":\"no such app\"}"), "GET", "/v1/apps/x", "");
+  assertEqString(r.unwrapErr(), "no such app (404)", "404");
+  assertEqString(
+    call(constant(500, "{\"error\":\"store failure\"}"), "GET", "/x", "").unwrapErr(),
+    "store failure (500)",
+    "500",
+  );
+  assert(
+    call(constant(401, "{\"error\":\"unauthorized\"}"), "GET", "/x", "")
+        .unwrapErr()
+        .includes("token"),
+    "401 mentions the token",
+  );
+  assertEqString(
+    call(constant(502, "plain text"), "GET", "/x", "").unwrapErr(),
+    "plain text (502)",
+    "not JSON",
+  );
+  assertEqString(
+    call(constant(503, ""), "GET", "/x", "").unwrapErr(),
+    "orbitd answered 503",
+    "no body",
+  );
+  assertEqString(call(constant(204, ""), "DELETE", "/x", "").unwrap(), "", "204 is success");
+}
+
+@Test
+function aBodyThatIsNotJsonIsAnError(): void {
+  assert(listApps(constant(200, "<html>")).isErr(), "not JSON");
+  const net: Api = (req: ApiRequest): Result<ApiResponse, string> => Err("connection refused");
+  assertEqString(listApps(net).unwrapErr(), "connection refused", "network error passes through");
+}
+
+@Test
+function logQueriesCarryTheFiltersAndTheCursor(): void {
+  const echo: Api = (req: ApiRequest): Result<ApiResponse, string> => Ok(
+    status(200, "[{\"id\":1,\"message\":\"" + req.path + "\"}]"),
+  );
+  const lines = logsAfter(echo, "hello", "warn", "a b", 41, 200).unwrap();
+  assertEqString(
+    lines[0].message,
+    "/v1/logs?app=hello&level=warn&contains=a%20b&after=41&limit=200",
+    "path",
+  );
+  const plain = logsAfter(echo, "", "", "", 0, 100).unwrap();
+  assertEqString(plain[0].message, "/v1/logs?limit=100", "no filters");
+}
+
+@Test
+function theFakeServesTheTypedCalls(): void {
+  const api = fakeApi();
+  assertEq(listApps(api).unwrap().length.toInt(), 2, "apps");
+  const app = getApp(api, "hello").unwrap();
+  assertEq(app.deployments.length.toInt(), 2, "deployments");
+  assertEq(app.activeDeployment, 2, "active");
+  assertEqString(app.kind, "job", "kind from the active deployment's spec");
+  assertEqString(getRun(api, "abc").unwrap().status, "succeeded", "run");
+  assertEq(runTrace(api, "abc").unwrap().length.toInt(), 3, "spans");
+  assertEqString(runNow(api, "hello").unwrap().id, "fresh", "run now");
+  assert(runNow(api, "svc").unwrapErr().endsWith("(409)"), "a service cannot be run");
+}
+
+@Test
+function decodersToleratePartialAndNullFields(): void {
+  const r = decodeRun(json("{\"id\":\"x\",\"exit_code\":null,\"wall_ms\":null,\"error\":null}"));
+  assertEqString(r.id, "x", "id");
+  assert(r.exitCode.isNone() && r.wallMs.isNone() && r.fuel.isNone(), "nulls are absent");
+  assertEqString(r.error, "", "null error is empty");
+  assertEqString(r.status, "", "missing status is empty");
+  assertEq(decodeApps(json("[{}]")).length.toInt(), 1, "an empty object is an app");
+  assertEq(decodeApps(json("{}")).length.toInt(), 0, "not an array is empty");
+  const d = decodeAppDetail(json("{}"));
+  assertEq(d.deployments.length.toInt(), 0, "no deployments");
+}
+
+@Test
+function spansAndLogsAndQueuesDecode(): void {
+  const spans = decodeSpans(
+    json(
+      "{\"spans\":[{\"name\":\"run\",\"parent_id\":null,\"start_us\":10,\"end_us\":30,\"attrs\":{\"a\":1}},{\"name\":\"load\",\"parent_id\":\"p\",\"start_us\":10,\"end_us\":20,\"attrs\":{}}]}",
+    ),
+  );
+  assertEqString(spans[0].parentId, "", "root has no parent");
+  assertEqString(spans[1].parentId, "p", "child");
+  assertEqString(spans[0].attrs, "{\"a\":1}", "attrs as text");
+  const logs = decodeLogs(
+    json(
+      "[{\"id\":3,\"app\":\"a\",\"level\":\"warn\",\"message\":\"m\",\"run_id\":null,\"ts\":5}]",
+    ),
+  );
+  assertEq(logs[0].id, 3, "id");
+  assertEqString(logs[0].runId, "", "null run");
+  const qs = decodeQueues(
+    json("[{\"queue\":\"q\",\"ready\":1,\"leased\":2,\"dead\":3,\"done\":4}]"),
+  );
+  assertEq(qs[0].dead, 3, "dead");
+  const dead = decodeDead(json("[{\"id\":9,\"body\":\"b\",\"attempts\":2,\"last_error\":null}]"));
+  assertEqString(dead[0].lastError, "", "no error text");
+}
+
+@Test
+function statsCarryBucketsPercentilesAndTheServerClock(): void {
+  const api = fakeApi();
+  const s = stats(api, "", 0, 0, 3600000).unwrap();
+  assertEq(s.buckets.length.toInt(), 24, "buckets");
+  assertEq(s.until, 1792400000000, "until comes from orbitd");
+  assert(
+    s.buckets[0].p95.isSome() && s.buckets[5].p95.isNone(),
+    "an empty bucket has no percentile",
+  );
+  assertEq(s.buckets[5].succeeded + s.buckets[5].failed, 0, "and no runs");
+  assertEq(s.totals.p95.unwrap(), 4100, "totals");
+  const none = stats(api, "nobody", 0, 0, 3600000).unwrap();
+  assertEq(none.totals.succeeded, 0, "an app without runs");
+  const echo: Api = (req: ApiRequest): Result<ApiResponse, string> => Ok(
+    status(
+      200,
+      "{\"since\":0,\"until\":0,\"bucket_ms\":1,\"buckets\":[],\"totals\":{\"t\":0,\"succeeded\":0,\"failed\":0,\"running\":0,\"logs\":0}}",
+    ),
+  );
+  let seen = "";
+  const spy: Api = (req: ApiRequest): Result<ApiResponse, string> => Err(req.path);
+  assertEqString(
+    stats(spy, "a b", 5, 9, 7200000).unwrapErr(),
+    "/v1/stats?app=a%20b&since=5&until=9&bucket=7200000",
+    "the query",
+  );
+  assertEqString(
+    stats(spy, "", 0, 0, 3600000).unwrapErr(),
+    "/v1/stats?bucket=3600000",
+    "defaults are left to orbitd",
+  );
+}
+
+@Test
+function theNodeAndRunsDecode(): void {
+  const n = nodeInfo(fakeApi()).unwrap();
+  assertEqString(n.version, "0.1.0", "version");
+  assertEq(n.abi, 1, "abi");
+  assertEqString(n.kinds.join(","), "job,service,consumer", "kinds are plain strings");
+  assertEq(n.workers.length.toInt(), 1, "workers");
+  assertEqString(n.workers[0], "mailer", "worker app");
+  const r = getRun(fakeApi(), "abc").unwrap();
+  assertEq(r.wallUs.unwrap(), 546123, "microseconds");
+  assertEq(r.wallMs.unwrap(), 546, "milliseconds");
+  assert(r.hostCalls.includes("log/v1"), "host calls as text");
+}

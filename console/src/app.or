@@ -1,0 +1,322 @@
+// The console's HTTP application: routing, sign-in, the screens, the event endpoint and the push stream. Nothing in this file
+// touches a socket; `main.or` serves it and the tests drive it with orin-web's TestClient against a fake `Api`.
+import { Sender, channel } from "std:task";
+import { parseQuery, PlusAsSpace } from "std:url";
+import {
+  Router, Request, Response, WebError, Handler, Middleware, withMiddleware, constantTimeEquals,
+  unauthorized, badRequest, statusError, notFound, internalError, logger, Asset, assetsHandler,
+  SseEvent,
+} from "orin-web";
+import {
+  Program, sessionOf, renderHtml, parseClientMessage, Join, Event, ClientEvent, dElement, dText,
+  domAttr, mountMessage,
+} from "orin-ui";
+import { Api } from "./api";
+import {
+  Hub, newSession, resolveEvent, applyMessages, joinSession, peekModel, login, isLoggedIn, logout,
+} from "./hub";
+import {
+  Model, Msg, Page, initialModel, formField, NoticePage, StreamFailed, LinesArrived, Refresh,
+  hasLiveLogs, TabOverview, OverviewPage, AppsPage, AppPage, RunsPage, RunPage, LogsPage,
+  QueuesPage, KvPage, SettingsPage,
+} from "./model";
+import {
+  Route, RouteOverview, RouteApps, RouteApp, RouteRuns, RouteRun, RouteLogs, RouteQueues, RouteKv,
+  RouteSettings, loadModel, isNotFound, perform, fetchLines, tabOf,
+} from "./effects";
+import { program } from "./program";
+import { screenPage, loginPage } from "./page";
+
+export type Deps = {
+  api: Api;
+  hub: Hub;
+  consoleToken: string;
+  assets: Asset[];
+  accessLog: bool;
+  // How the shell names the node: "host:port" of orbitd.
+  nodeLabel: string;
+};
+
+const COOKIE: string = "orbit_console";
+
+// The value of cookie `name` in a Cookie header ("" when absent).
+export function cookieValue(header: string, name: string): string {
+  for (const part of header.split(";")) {
+    const kv = part.trim();
+    const eq = kv.indexOf("=");
+    if (eq.isSome() && kv.substring(0, eq.unwrap()) == name) {
+      return kv.substring(eq.unwrap() + 1, kv.length);
+    }
+  }
+  return "";
+}
+
+function sessionCookie(req: Request): string {
+  const h = req.header("Cookie");
+  return h.isSome() ? cookieValue(h.unwrap(), COOKIE) : "";
+}
+
+function setCookie(res: Response, value: string, maxAge: int): Response {
+  return res.withHeader(
+    "Set-Cookie",
+    COOKIE + "=" + value + "; Path=/; HttpOnly; SameSite=Strict; Max-Age=" + maxAge.toString(),
+  );
+}
+
+function noStore(res: Response): Response {
+  return res.withHeader("Cache-Control", "no-store");
+}
+
+// ------------------------------------------------------------------------------------------------ sign-in
+
+function signedIn(d: Deps, req: Request): bool {
+  const bearer = req.bearerToken();
+  if (bearer.isSome() && constantTimeEquals(bearer.unwrap(), d.consoleToken)) {
+    return true;
+  }
+  return isLoggedIn(d.hub, sessionCookie(req));
+}
+
+// Every guarded route: a bearer token, a login cookie, or (GET only) `?token=` which is exchanged for a cookie and redirected
+// away so that the token does not stay in the address bar. Otherwise a page request is sent to /login, anything else gets 401.
+function auth(d: Deps): Middleware {
+  return (req: Request, next: Handler): Result<Response, WebError> => {
+    if (signedIn(d, req)) {
+      return next(req);
+    }
+    const t = req.query("token");
+    if (t.isSome() && req.methodText() == "GET" && constantTimeEquals(t.unwrap(), d.consoleToken)) {
+      const id = login(d.hub);
+      if (id.isNone()) {
+        return Err(statusError(503, "cannot sign in: restart the console (no more login entropy)"));
+      }
+      const res = Response.redirect(303, req.path())?;
+      return Ok(noStore(setCookie(res, id.unwrap(), 604800)));
+    }
+    if (req.methodText() == "GET") {
+      return Response.redirect(303, "/login");
+    }
+    return Err(unauthorized("sign in at /login, or send the console token as a bearer token"));
+  };
+}
+
+function loginForm(d: Deps): Handler {
+  return (req: Request): Result<Response, WebError> => Ok(
+    noStore(Response.html(200, loginPage(""))),
+  );
+}
+
+function loginSubmit(d: Deps): Handler {
+  return (req: Request): Result<Response, WebError> => {
+    const body = req.bodyText()?;
+    const given = formField(body, "token");
+    if (!constantTimeEquals(given, d.consoleToken)) {
+      return Ok(noStore(Response.html(401, loginPage("That token is not right."))));
+    }
+    const id = login(d.hub);
+    if (id.isNone()) {
+      return Ok(
+        noStore(
+          Response.html(
+            503,
+            loginPage("Cannot sign in: restart the console (no more login entropy)."),
+          ),
+        ),
+      );
+    }
+    const res = Response.redirect(303, "/")?;
+    return Ok(noStore(setCookie(res, id.unwrap(), 604800)));
+  };
+}
+
+function logoutHandler(d: Deps): Handler {
+  return (req: Request): Result<Response, WebError> => {
+    logout(d.hub, sessionCookie(req));
+    const res = Response.redirect(303, "/login")?;
+    return Ok(noStore(setCookie(res, "", 0)));
+  };
+}
+
+// ------------------------------------------------------------------------------------------------ screens
+
+function titleOf(p: Page): string {
+  return match (p) {
+    OverviewPage(v) => "Overview - Orbit Cloud",
+    AppsPage(v) => "Apps - Orbit Cloud",
+    AppPage(v) => v.detail.name + " - Orbit Cloud",
+    RunsPage(v) => "Runs - Orbit Cloud",
+    RunPage(v) => "Run " + v.run.id + " - Orbit Cloud",
+    LogsPage => "Logs - Orbit Cloud",
+    QueuesPage(v) => "Queues - Orbit Cloud",
+    KvPage(v) => "KV - Orbit Cloud",
+    SettingsPage(v) => "Settings - Orbit Cloud",
+    NoticePage(t, b, bad) => t + " - Orbit Cloud",
+  };
+}
+
+// Builds the page of `route`: loads its data, opens a UI session on it and renders the first screen.
+function screen(d: Deps, route: Route): Result<Response, WebError> {
+  const loaded = loadModel(d.api, route, d.nodeLabel);
+  let status = 200;
+  let model = initialModel(NoticePage("", "", false), None, d.nodeLabel);
+  if (loaded.isOk()) {
+    model = loaded.unwrap();
+  } else {
+    const e = loaded.unwrapErr();
+    status = isNotFound(e) ? 404 : 502;
+    model = initialModel(
+      NoticePage(isNotFound(e) ? "Not found" : "Cannot reach orbitd", e, true),
+      None,
+      d.nodeLabel,
+    );
+  }
+  const sid = newSession(d.hub, model);
+  if (sid.isNone()) {
+    return Err(statusError(503, "the console is shutting down"));
+  }
+  const dom = sessionOf<Model, Msg>(program(), model).dom;
+  const html = screenPage(
+    titleOf(model.page),
+    renderHtml(dom),
+    sid.unwrap(),
+    0,
+    hasLiveLogs(model.page),
+  );
+  return Ok(noStore(Response.html(status, html)));
+}
+
+function screenHandler(d: Deps, route: Route): Handler {
+  return (req: Request): Result<Response, WebError> => screen(d, route);
+}
+
+function appHandler(d: Deps): Handler {
+  return (req: Request): Result<Response, WebError> => {
+    const name = req.param("name").unwrapOr("");
+    const tab = tabOf(req.param("tab").unwrapOr(""));
+    if (tab.isNone()) {
+      return Err(notFound("no such tab"));
+    }
+    return screen(d, RouteApp(name, tab.unwrap(), req.query("ns").unwrapOr("")));
+  };
+}
+// ------------------------------------------------------------------------------------------------ events and stream
+
+function json(body: string): Response {
+  return noStore(Response.text(200, body).withContentType("application/json"));
+}
+
+// What a browser sees when its session is gone (the console restarted, or it was evicted): a notice in place of the screen.
+function expiredMessage(): string {
+  return mountMessage([
+    dElement(
+      "div",
+      [domAttr("class", "flash bad")],
+      [dText("This page is out of date. Reload it to continue.")],
+    ),
+  ]);
+}
+
+function eventsHandler(d: Deps): Handler {
+  return (req: Request): Result<Response, WebError> => {
+    const sid = req.header("X-Orin-UI-Session").unwrapOr("");
+    const body = req.bodyText()?;
+    const parsed = parseClientMessage(body);
+    if (parsed.isErr()) {
+      return Err(badRequest(parsed.unwrapErr()));
+    }
+    return match (parsed.unwrap()) {
+      Join => {
+        const mount = joinSession(d.hub, sid);
+        return Ok(json(mount.isSome() ? mount.unwrap() : expiredMessage()));
+      },
+      Event(ev) => {
+        const known = peekModel(d.hub, sid);
+        if (known.isNone()) {
+          return Ok(json(expiredMessage()));
+        }
+        const resolved = resolveEvent(d.hub, sid, ev);
+        if (resolved.isNone()) {
+          return Ok(json("{\"t\":\"patch\",\"ops\":[]}")); // the element has no handler any more: nothing to do
+        }
+        const r = resolved.unwrap();
+        const results = perform(d.api, r.model, r.msg);
+        const patch = applyMessages(d.hub, sid, [r.msg].concat(results));
+        return Ok(json(patch.isSome() ? patch.unwrap() : expiredMessage()));
+      },
+    };
+  };
+}
+
+// GET /ui/stream?s=SESSION -- one poll of the live log, as server-sent events. The response carries the patch for the lines that
+// arrived since the last poll (if any) and ends; the browser's EventSource reconnects after the `retry` delay. orin-web handlers
+// have no timers (a closure cannot hold a ClockGrant), so the browser's reconnect is the clock.
+function streamHandler(d: Deps): Handler {
+  return (req: Request): Result<Response, WebError> => {
+    const sid = req.query("s").unwrapOr("");
+    const model = peekModel(d.hub, sid);
+    if (model.isNone()) {
+      return Err(notFound("unknown session"));
+    }
+    const events = channel<SseEvent>(4);
+    const m = model.unwrap();
+    let delay = 1500;
+    if (m.logs.following && hasLiveLogs(m.page)) {
+      delay = 500;
+      const fetched = fetchLines(d.api, m.logs.filter, m.logs.lastId, 200);
+      let msgs: Msg[] = [];
+      if (fetched.isOk()) {
+        msgs = fetched.unwrap();
+      } else {
+        msgs = [StreamFailed(fetched.unwrapErr())];
+      }
+      if (msgs.length > 0 || m.logs.error.length > 0) {
+        const patch = applyMessages(d.hub, sid, msgs.length > 0 ? msgs : [StreamFailed("")]);
+        if (patch.isSome()) {
+          events.tx.send(SseEvent { event: None, data: patch.unwrap(), id: None, retry: None });
+        }
+      }
+    }
+    events.tx.send(SseEvent { event: None, data: "", id: None, retry: Some(delay) });
+    events.tx.close();
+    const rx = events.rx;
+    return Ok(Response.sse(() => rx.recv()));
+  };
+}
+
+// ------------------------------------------------------------------------------------------------ the router
+
+export function buildApp(d: Deps): Router {
+  const guard = auth(d);
+  let app = new Router();
+  if (d.accessLog) {
+    app.use(logger((line: string) => console.error(line)));
+  }
+  app.get("/healthz", (req: Request): Result<Response, WebError> => Ok(Response.text(200, "ok")));
+  app.get("/assets/*path", assetsHandler(d.assets, "", "no-cache"));
+  app.get("/favicon.ico", (req: Request): Result<Response, WebError> => Ok(Response.empty(204)));
+  app.get("/login", loginForm(d));
+  app.post("/login", loginSubmit(d));
+  app.post("/logout", withMiddleware(guard, logoutHandler(d)));
+  app.get("/", withMiddleware(guard, screenHandler(d, RouteOverview)));
+  app.get("/apps", withMiddleware(guard, screenHandler(d, RouteApps)));
+  app.get("/runs", withMiddleware(guard, screenHandler(d, RouteRuns)));
+  app.get("/logs", withMiddleware(guard, screenHandler(d, RouteLogs)));
+  app.get("/queues", withMiddleware(guard, screenHandler(d, RouteQueues)));
+  app.get("/kv", withMiddleware(guard, screenHandler(d, RouteKv)));
+  app.get("/settings", withMiddleware(guard, screenHandler(d, RouteSettings)));
+  app.get("/apps/:name", withMiddleware(guard, appHandler(d)));
+  app.get("/apps/:name/:tab", withMiddleware(guard, appHandler(d)));
+  app.get(
+    "/runs/:id",
+    withMiddleware(
+      guard,
+      (req: Request): Result<Response, WebError> => screen(
+        d,
+        RouteRun(req.param("id").unwrapOr("")),
+      ),
+    ),
+  );
+  app.post("/ui/events", withMiddleware(guard, eventsHandler(d)));
+  app.get("/ui/stream", withMiddleware(guard, streamHandler(d)));
+  return app;
+}

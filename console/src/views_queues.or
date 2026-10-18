@@ -1,0 +1,243 @@
+// Queues, the KV overview, settings and plain notices.
+import {
+  Node, el, text, cls, href, attr, key, nothing, PageHeader, Grid, Card, FlushCard, Stack, KeyValue,
+  KeyValueGroup, pair, textPair, Table, column, tableRow, unsorted, EmptyState, StatusPill, Badge,
+  ToneDanger, ToneNeutral, ToneSuccess, ToneWarning, Button, SmallButton, ButtonPrimary,
+  ButtonSecondary, ButtonGhost, IconLabelButton, LinkButton, Mono, Inline, ThemeToggle, Banner,
+} from "orin-ui";
+import { Queue, DeadLetter } from "./types";
+import {
+  Model, Msg, QueuesData, KvRow, SettingsData, OpenDialog, PublishDialog, ShowDead, HideDead,
+  Redrive, Refresh,
+} from "./model";
+import { clip } from "./fmt";
+import { noop, appTabHref } from "./views_common";
+import { seg } from "./api";
+
+function Count(label: string, n: int, bad: bool): Node<Msg> {
+  return el<Msg>(
+    "div",
+    [key<Msg>(label), cls<Msg>(bad ? "qcount bad" : "qcount")],
+    [
+      el<Msg>("div", [cls<Msg>("n")], [text<Msg>(n.toString())]),
+      el<Msg>("div", [cls<Msg>("l")], [text<Msg>(label)]),
+    ],
+  );
+}
+
+function QueueCard(q: Queue, open: bool): Node<Msg> {
+  return Card<Msg>(
+    q.queue,
+    [q.dead > 0 ? Badge<Msg>(q.dead.toString() + " dead", ToneDanger) : StatusPill<Msg>("healthy")],
+    [
+      el<Msg>(
+        "div",
+        [cls<Msg>("qcounts")],
+        [
+          Count("Ready", q.ready, false),
+          Count("Leased", q.leased, false),
+          Count("Dead", q.dead, q.dead > 0),
+          Count("Done", q.done, false),
+        ],
+      ),
+      q.dead > 0
+          ? el<Msg>(
+            "div",
+            [cls<Msg>("ou-inline qactions")],
+            [
+              SmallButton<Msg>(
+                open ? "Hide dead letters" : "Dead letters",
+                ButtonSecondary,
+                open ? HideDead : ShowDead(q.queue),
+              ),
+              SmallButton<Msg>("Redrive", ButtonSecondary, Redrive(q.queue)),
+            ],
+          )
+          : nothing<Msg>(),
+    ],
+  );
+}
+
+function DeadRow(d: DeadLetter): Node<Msg>[] {
+  return [
+    Mono<Msg>(d.id.toString()),
+    text<Msg>(d.attempts.toString()),
+    Mono<Msg>(clip(d.body, 120)),
+    el<Msg>("span", [cls<Msg>("ou-danger-text")], [text<Msg>(d.lastError)]),
+  ];
+}
+
+export function QueuesView(m: Model, d: QueuesData): Node<Msg> {
+  const open = d.dead.isSome() ? d.dead.unwrap().queue : "";
+  return Stack<Msg>([
+    PageHeader<Msg>(
+      "Queues",
+      "Messages waiting for consumers, and the ones that gave up.",
+      [],
+      [
+        IconLabelButton<Msg>("refresh", "Refresh", ButtonSecondary, Refresh),
+        IconLabelButton<Msg>("plus", "Publish message", ButtonPrimary, OpenDialog(PublishDialog)),
+      ],
+    ),
+    d.queues.length == 0
+        ? Card<Msg>(
+          "",
+          [],
+          [
+            EmptyState<Msg>(
+              "queues",
+              "No queues yet",
+              "A queue exists once its first message arrives.",
+              [Button<Msg>("Publish a message", ButtonPrimary, OpenDialog(PublishDialog))],
+            ),
+          ],
+        )
+        : Grid<Msg>(3, d.queues.map(q => QueueCard(q, q.queue == open))),
+    d.dead.isSome()
+        ? FlushCard<Msg>(
+          "Dead letters of " + d.dead.unwrap().queue,
+          [
+            SmallButton<Msg>("Redrive all", ButtonSecondary, Redrive(d.dead.unwrap().queue)),
+            SmallButton<Msg>("Close", ButtonGhost, HideDead),
+          ],
+          [
+            Table<Msg>(
+              [
+                column("id", "Id"),
+                column("attempts", "Attempts"),
+                column("body", "Message"),
+                column("err", "Last error"),
+              ],
+              d.dead.unwrap().letters.map(l => tableRow<Msg>(l.id.toString(), DeadRow(l))),
+              unsorted(),
+              noop,
+              EmptyState<Msg>("check", "No dead letters", "", []),
+            ),
+          ],
+        )
+        : nothing<Msg>(),
+  ]);
+}
+
+export function KvOverview(m: Model, rows: KvRow[]): Node<Msg> {
+  return Stack<Msg>([
+    PageHeader<Msg>("KV", "The key-value data of every app, by namespace.", [], []),
+    FlushCard<Msg>(
+      "",
+      [],
+      [
+        Table<Msg>(
+          [
+            column("app", "App"),
+            column("ns", "Namespace"),
+            column("entries", "Entries"),
+            column("open", ""),
+          ],
+          rows.map(
+            r => tableRow<Msg>(
+              r.app + "/" + r.namespace,
+              [
+                el<Msg>("a", [href<Msg>("/apps/" + seg(r.app))], [text<Msg>(r.app)]),
+                Mono<Msg>(r.namespace),
+                text<Msg>(r.entries.toString()),
+                LinkButton<Msg>(
+                  "Browse",
+                  ButtonSecondary,
+                  appTabHref(r.app, "kv") + "?ns=" + seg(r.namespace),
+                ),
+              ],
+            ),
+          ),
+          unsorted(),
+          noop,
+          EmptyState<Msg>(
+            "kv",
+            "No KV data",
+            "Apps get KV namespaces at deploy time: occtl deploy NAME app.wasm --kv NAME.",
+            [],
+          ),
+        ),
+      ],
+    ),
+  ]);
+}
+
+export function SettingsView(m: Model, d: SettingsData): Node<Msg> {
+  const node = d.node;
+  return Stack<Msg>([
+    PageHeader<Msg>("Settings", "This console and the node it manages.", [], []),
+    Grid<Msg>(
+      2,
+      [
+        Card<Msg>(
+          "Node",
+          [
+            node.isSome()
+                ? Badge<Msg>("Online", ToneSuccess)
+                : Badge<Msg>("Unreachable", ToneDanger),
+          ],
+          [
+            node.isSome()
+                ? KeyValue<Msg>([
+                  textPair<Msg>("Endpoint", m.nodeLabel),
+                  textPair<Msg>("Version", node.unwrap().version),
+                  textPair<Msg>("Orbit ABI", node.unwrap().abi.toString()),
+                  textPair<Msg>("App kinds", node.unwrap().kinds.join(", ")),
+                  textPair<Msg>(
+                    "Running workers",
+                    node.unwrap().workers.length > 0 ? node.unwrap().workers.join(", ") : "none",
+                  ),
+                ])
+                : Banner<Msg>(ToneDanger, "orbitd is not reachable", m.nodeLabel, []),
+          ],
+        ),
+        Card<Msg>(
+          "This console",
+          [],
+          [
+            KeyValue<Msg>([
+              textPair<Msg>("Talks to", m.nodeLabel + " (HTTP /v1)"),
+              textPair<Msg>("Written in", "Orin, on orin-web and orin-ui"),
+              pair<Msg>(
+                "Theme",
+                Inline<Msg>([
+                  ThemeToggle<Msg>(),
+                  el<Msg>(
+                    "span",
+                    [cls<Msg>("ou-muted")],
+                    [text<Msg>("light, dark or follow the system")],
+                  ),
+                ]),
+              ),
+            ]),
+          ],
+        ),
+      ],
+    ),
+  ]);
+}
+
+export function NoticeView(title: string, message: string, bad: bool): Node<Msg> {
+  return Stack<Msg>([
+    PageHeader<Msg>(title, "", [], []),
+    Card<Msg>(
+      "",
+      [],
+      [
+        bad
+            ? Banner<Msg>(
+              ToneDanger,
+              title,
+              message,
+              [LinkButton<Msg>("Overview", ButtonSecondary, "/")],
+            )
+            : EmptyState<Msg>(
+              "check",
+              title,
+              message,
+              [LinkButton<Msg>("Back to the apps", ButtonPrimary, "/apps")],
+            ),
+      ],
+    ),
+  ]);
+}

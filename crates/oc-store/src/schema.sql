@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS runs (
     started_at    INTEGER NOT NULL,
     finished_at   INTEGER,
     wall_ms       INTEGER,
+    wall_us       INTEGER,
     fuel          INTEGER,
     peak_memory   INTEGER,
     host_calls    TEXT,

@@ -1,0 +1,4 @@
+// A service that logs once and finishes; with restart policy "on-failure" it is not started again.
+function main(): void {
+  console.log("ticker: up");
+}

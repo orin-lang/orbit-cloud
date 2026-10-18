@@ -1,0 +1,202 @@
+// The console's view of orbitd: an `Api` is a function from a request to a response. The real one talks HTTP (transport.or);
+// tests pass a function over canned data. Every screen is written against `Api`, never against a socket.
+import { JsonValue } from "std:json";
+import { percentEncode, PercentSpace } from "std:url";
+import { parseJson, errorText, items, intOr, member, asInt } from "./jv";
+import {
+  AppSummary, AppDetail, Run, Span, LogLine, KvNamespace, KvEntry, Queue, DeadLetter, Stats,
+  NodeInfo,
+} from "./types";
+import {
+  decodeApps, decodeAppDetail, decodeRun, decodeRuns, decodeSpans, decodeLogs, decodeNamespaces,
+  decodeKvEntries, decodeQueues, decodeDead, decodeStats, decodeNode,
+} from "./decode";
+
+// `path` starts with /v1 and includes the query string.
+export type ApiRequest = { method: string; path: string; body: string; };
+export type ApiResponse = { status: int; body: string; };
+export type Api = (req: ApiRequest) => Result<ApiResponse, string>;
+
+// One path segment, percent-encoded.
+export function seg(s: string): string {
+  return percentEncode(s, PercentSpace);
+}
+
+// A query string from pairs; pairs with an empty value are left out. "" or "?a=b".
+export function query(names: string[], values: string[]): string {
+  let out = "";
+  let i: usize = 0;
+  while (i < names.length) {
+    if (values[i].length > 0) {
+      out += (out.length == 0 ? "?" : "&") + seg(names[i]) + "=" + seg(values[i]);
+    }
+    i += 1;
+  }
+  return out;
+}
+
+function failure(status: int, body: string): string {
+  const text = errorText(body);
+  if (status == 401) {
+    return "orbitd refused the console's API token (401)";
+  }
+  return text.length > 0
+      ? text + " (" + status.toString() + ")"
+      : "orbitd answered " + status.toString();
+}
+
+// The body of a 2xx answer, or the error to show.
+export function call(api: Api, method: string, path: string, body: string): Result<string, string> {
+  const r = api(ApiRequest { method: method, path: path, body: body });
+  if (r.isErr()) {
+    return Err(r.unwrapErr());
+  }
+  const res = r.unwrap();
+  if (res.status < 200 || res.status > 299) {
+    return Err(failure(res.status, res.body));
+  }
+  return Ok(res.body);
+}
+
+function getJson(api: Api, path: string): Result<JsonValue, string> {
+  const body = call(api, "GET", path, "")?;
+  const j = parseJson(body);
+  if (j.isNone()) {
+    return Err("orbitd sent a body that is not JSON (" + path + ")");
+  }
+  return Ok(j.unwrap());
+}
+
+export function listApps(api: Api): Result<AppSummary[], string> {
+  return Ok(decodeApps(getJson(api, "/v1/apps")?));
+}
+
+export function getApp(api: Api, name: string): Result<AppDetail, string> {
+  return Ok(decodeAppDetail(getJson(api, "/v1/apps/" + seg(name))?));
+}
+
+export function appRuns(api: Api, name: string, limit: int): Result<Run[], string> {
+  return Ok(decodeRuns(getJson(api, "/v1/apps/" + seg(name) + "/runs?limit=" + limit.toString())?));
+}
+
+export function recentRuns(api: Api, limit: int): Result<Run[], string> {
+  return Ok(decodeRuns(getJson(api, "/v1/runs?limit=" + limit.toString())?));
+}
+
+export function getRun(api: Api, id: string): Result<Run, string> {
+  return Ok(decodeRun(getJson(api, "/v1/runs/" + seg(id))?));
+}
+
+export function runTrace(api: Api, id: string): Result<Span[], string> {
+  return Ok(decodeSpans(getJson(api, "/v1/runs/" + seg(id) + "/trace")?));
+}
+
+export function runLogs(api: Api, id: string, limit: int): Result<LogLine[], string> {
+  return Ok(decodeLogs(getJson(api, "/v1/runs/" + seg(id) + "/logs?limit=" + limit.toString())?));
+}
+
+export function kvNamespaces(api: Api, app: string): Result<KvNamespace[], string> {
+  return Ok(decodeNamespaces(getJson(api, "/v1/apps/" + seg(app) + "/kv")?));
+}
+
+export function kvEntries(
+  api: Api,
+  app: string,
+  ns: string,
+  limit: int,
+): Result<KvEntry[], string> {
+  return Ok(
+    decodeKvEntries(
+      getJson(api, "/v1/apps/" + seg(app) + "/kv/" + seg(ns) + "?limit=" + limit.toString())?,
+    ),
+  );
+}
+
+export function activate(api: Api, app: string, deployment: int): Result<void, string> {
+  call(
+    api,
+    "POST",
+    "/v1/apps/" + seg(app) + "/deployments/" + deployment.toString() + "/activate",
+    "",
+  )?;
+  return Ok();
+}
+
+// Runs the active deployment once and waits for the end (orbitd's POST /runs).
+export function runNow(api: Api, app: string): Result<Run, string> {
+  const body = call(api, "POST", "/v1/apps/" + seg(app) + "/runs", "")?;
+  const j = parseJson(body);
+  if (j.isNone()) {
+    return Err("orbitd sent a body that is not JSON");
+  }
+  return Ok(decodeRun(j.unwrap()));
+}
+
+export function deleteApp(api: Api, app: string): Result<void, string> {
+  call(api, "DELETE", "/v1/apps/" + seg(app), "")?;
+  return Ok();
+}
+
+export function listQueues(api: Api): Result<Queue[], string> {
+  return Ok(decodeQueues(getJson(api, "/v1/queues")?));
+}
+
+export function deadLetters(api: Api, queue: string, limit: int): Result<DeadLetter[], string> {
+  return Ok(
+    decodeDead(getJson(api, "/v1/queues/" + seg(queue) + "/dead?limit=" + limit.toString())?),
+  );
+}
+
+// Returns the number of messages made ready again.
+export function redrive(api: Api, queue: string): Result<int, string> {
+  const body = call(api, "POST", "/v1/queues/" + seg(queue) + "/redrive", "")?;
+  const j = parseJson(body);
+  return Ok(j.isSome() ? intOr(j.unwrap(), "redriven", 0) : 0);
+}
+
+// Returns the id of the new message.
+export function publish(api: Api, queue: string, message: string): Result<int, string> {
+  const body = call(api, "POST", "/v1/queues/" + seg(queue) + "/messages", message)?;
+  const j = parseJson(body);
+  return Ok(j.isSome() ? intOr(j.unwrap(), "id", 0) : 0);
+}
+
+// Log lines with id above `after` that match the filters; the newest `limit` of them, oldest first.
+export function logsAfter(
+  api: Api,
+  app: string,
+  level: string,
+  contains: string,
+  after: int,
+  limit: int,
+): Result<LogLine[], string> {
+  const q = query(
+    ["app", "level", "contains", "after", "limit"],
+    [app, level, contains, after > 0 ? after.toString() : "", limit.toString()],
+  );
+  return Ok(decodeLogs(getJson(api, "/v1/logs" + q)?));
+}
+
+// Run statistics per bucket (orbitd's GET /v1/stats). `until` 0: now, as orbitd sees it; `since` 0: 24 hours before `until`.
+export function stats(
+  api: Api,
+  app: string,
+  since: int,
+  until: int,
+  bucketMs: int,
+): Result<Stats, string> {
+  const q = query(
+    ["app", "since", "until", "bucket"],
+    [
+      app,
+      since > 0 ? since.toString() : "",
+      until > 0 ? until.toString() : "",
+      bucketMs.toString(),
+    ],
+  );
+  return Ok(decodeStats(getJson(api, "/v1/stats" + q)?));
+}
+
+export function nodeInfo(api: Api): Result<NodeInfo, string> {
+  return Ok(decodeNode(getJson(api, "/v1/node")?));
+}

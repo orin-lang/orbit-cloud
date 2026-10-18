@@ -1,0 +1,773 @@
+// The apps list and the page of one app with its tabs.
+import {
+  Node, Attr, onClick, el, text, cls, href, attr, key, nothing, PageHeader, Grid, Card, FlushCard,
+  Stack, StatCard, BarChart, ChartSpec, series, Table, column, sortableColumn, tableRow, TableRow,
+  SortState, unsorted, EmptyState, StatusPill, Badge, Tone, ToneSuccess, ToneDanger, ToneWarning,
+  ToneNeutral, ToneInfo, ToneAccent, Button, SmallButton, ButtonSecondary, ButtonPrimary,
+  ButtonDanger, ButtonGhost, LinkButton, IconLabelButton, compactNumber, Inline, Sparkline, Mono,
+  Tabs, linkTab, KeyValueGroup, KeyValue, pair, textPair, Pair, JsonText, CodeBlock, Banner, Crumb,
+  Toggle,
+} from "orin-ui";
+import {
+  JsonValue, ValueObject, ValueArray, ValueNull, ValueBool, ValueString, ValueNumber,
+} from "std:json";
+import { AppSummary, Deployment, Run, Stats, StatsBucket, KvNamespace, KvEntry } from "./types";
+import {
+  Model, Msg, AppsData, AppData, AppRow, AppTab, TabOverview, TabDeployments, TabRuns, TabLogs,
+  TabKv, TabSettings, SortApps, RunNow, Refresh, OpenDialog, ConfirmActivate, ConfirmDelete, ShowKv,
+  SelectKey, HideKv, ToggleRaw, ShowDiff, HideDiff,
+} from "./model";
+import { tabName } from "./effects";
+import { jsonText, parseJson, member, field, items, asString, asInt, asBool, optStr } from "./jv";
+import { dateTime, ago, duration, ratePercent, clip, hourMinute } from "./fmt";
+import { appHref, appTabHref, runHref, noop, RunsTable, RunDuration } from "./views_common";
+import { delta } from "./views_overview";
+import { LogsBody } from "./views_logs";
+
+// ------------------------------------------------------------------ the apps list
+
+function kindTone(kind: string): Tone {
+  return match (kind) {
+    "service" => ToneInfo,
+    "consumer" => ToneAccent,
+    _ => ToneNeutral,
+  };
+}
+
+function workerCell(a: AppSummary): Node<Msg> {
+  if (a.kind == "job") {
+    return el<Msg>("span", [cls<Msg>("ou-faint")], [text<Msg>("on demand")]);
+  }
+  return StatusPill<Msg>(a.workerRunning ? "running" : "stopped");
+}
+
+function lastRunCell(r: Option<Run>, now: int): Node<Msg> {
+  if (r.isNone()) {
+    return el<Msg>("span", [cls<Msg>("ou-faint")], [text<Msg>("never run")]);
+  }
+  const run = r.unwrap();
+  return Inline<Msg>([
+    StatusPill<Msg>(run.status),
+    el<Msg>(
+      "a",
+      [href<Msg>(runHref(run.id)), cls<Msg>("ou-muted")],
+      [text<Msg>(ago(now, run.startedAt))],
+    ),
+  ]);
+}
+
+function appRow(r: AppRow, now: int): TableRow<Msg> {
+  const a = r.app;
+  return tableRow<Msg>(
+    a.name,
+    [
+      el<Msg>("a", [href<Msg>(appHref(a.name)), cls<Msg>("ou-link-row")], [text<Msg>(a.name)]),
+      Badge<Msg>(a.kind, kindTone(a.kind)),
+      text<Msg>(a.version > 0 ? "v" + a.version.toString() : "-"),
+      lastRunCell(r.last, now),
+      Inline<Msg>([
+        Sparkline<Msg>(r.trend, 120, 28, 0, a.name + ": runs in the last 24 hours"),
+        el<Msg>("span", [cls<Msg>("ou-muted ou-num-inline")], [text<Msg>(compactNumber(r.runs24))]),
+      ]),
+      workerCell(a),
+      el<Msg>("span", [cls<Msg>("ou-muted")], [text<Msg>(dateTime(a.createdAt))]),
+    ],
+  );
+}
+
+function cmp(a: int, b: int): int {
+  return a < b ? -1 : a > b ? 1 : 0;
+}
+
+function sortedRows(rows: AppRow[], s: SortState): AppRow[] {
+  if (s.key.length == 0) {
+    return rows;
+  }
+  return rows.sort((x: AppRow, y: AppRow): int => {
+    const c = match (s.key) {
+      "name" => x.app.name < y.app.name ? -1 : x.app.name > y.app.name ? 1 : 0,
+      "kind" => x.app.kind < y.app.kind ? -1 : x.app.kind > y.app.kind ? 1 : 0,
+      "version" => cmp(x.app.version, y.app.version),
+      "runs" => cmp(x.runs24, y.runs24),
+      _ => 0,
+    };
+    return s.desc ? 0 - c : c;
+  });
+}
+
+export function AppsView(m: Model, d: AppsData): Node<Msg> {
+  return Stack<Msg>([
+    PageHeader<Msg>(
+      "Apps",
+      "Everything deployed on this node.",
+      [],
+      [IconLabelButton<Msg>("refresh", "Refresh", ButtonSecondary, Refresh)],
+    ),
+    FlushCard<Msg>(
+      "",
+      [],
+      [
+        Table<Msg>(
+          [
+            sortableColumn("name", "Name"),
+            sortableColumn("kind", "Kind"),
+            sortableColumn("version", "Version"),
+            column("last", "Last run"),
+            sortableColumn("runs", "Runs, 24 h"),
+            column("worker", "Worker"),
+            column("created", "Created"),
+          ],
+          sortedRows(d.rows, d.sort).map(r => appRow(r, d.now)),
+          d.sort,
+          k => SortApps(k),
+          EmptyState<Msg>("apps", "No apps yet", "Deploy one with: occtl deploy NAME app.wasm", []),
+        ),
+      ],
+    ),
+  ]);
+}
+
+// ------------------------------------------------------------------ one app
+
+function tabs(v: AppData): Node<Msg> {
+  const n = v.detail.name;
+  return Tabs<Msg>([
+    linkTab<Msg>("Overview", appTabHref(n, "overview"), isTab(v.tab, TabOverview), ""),
+    linkTab<Msg>(
+      "Deployments",
+      appTabHref(n, "deployments"),
+      isTab(v.tab, TabDeployments),
+      v.detail.deployments.length.toString(),
+    ),
+    linkTab<Msg>("Runs", appTabHref(n, "runs"), isTab(v.tab, TabRuns), ""),
+    linkTab<Msg>("Logs", appTabHref(n, "logs"), isTab(v.tab, TabLogs), ""),
+    linkTab<Msg>(
+      "KV",
+      appTabHref(n, "kv"),
+      isTab(v.tab, TabKv),
+      v.namespaces.length > 0 ? v.namespaces.length.toString() : "",
+    ),
+    linkTab<Msg>("Settings", appTabHref(n, "settings"), isTab(v.tab, TabSettings), ""),
+  ]);
+}
+
+function isTab(a: AppTab, b: AppTab): bool {
+  return tabName(a) == tabName(b);
+}
+
+function total(b: StatsBucket): int {
+  return b.succeeded + b.failed + b.running;
+}
+
+function OverviewTab(v: AppData): Node<Msg> {
+  const t = v.stats.totals;
+  const finished = t.succeeded + t.failed;
+  const labels = v.stats.buckets.map(b => hourMinute(b.t));
+  let ticks: string[] = [];
+  let i: usize = 0;
+  while (i < labels.length) {
+    ticks.push(i % 4 == 0 ? labels[i] : "");
+    i += 1;
+  }
+  const spec = ChartSpec {
+    title: "Runs per hour of " + v.detail.name,
+    labels: labels,
+    ticks: ticks,
+    series: [
+      series("succeeded", 0, v.stats.buckets.map(b => b.succeeded)),
+      series("failed", 1, v.stats.buckets.map(b => b.failed)),
+    ],
+    height: 200,
+    yFormat: compactNumber,
+    yMax: 0,
+    unit: "runs",
+    empty: "No runs in the last 24 hours",
+  };
+  let last: Option<Run> = None;
+  if (v.runs.length > 0) {
+    last = Some(v.runs[0]);
+  }
+  return Stack<Msg>([
+    Grid<Msg>(
+      4,
+      [
+        StatCard<Msg>(
+          "Runs, last 24 h",
+          compactNumber(total(t)),
+          "",
+          ToneNeutral,
+          v.stats.buckets.map(b => total(b)),
+          "",
+        ),
+        StatCard<Msg>(
+          "Error rate",
+          ratePercent(t.failed, finished),
+          "",
+          ToneNeutral,
+          v.stats.buckets.map(b => b.failed),
+          t.failed.toString() + " failed",
+        ),
+        StatCard<Msg>(
+          "p95 run time",
+          t.p95.isSome() ? duration(t.p95.unwrap()) : "-",
+          t.p50.isSome() ? "p50 " + duration(t.p50.unwrap()) : "",
+          ToneNeutral,
+          v.stats.buckets.map(b => b.p95.unwrapOr(0)),
+          "",
+        ),
+        StatCard<Msg>(
+          "Last run",
+          last.isSome() ? last.unwrap().status : "never",
+          "",
+          ToneNeutral,
+          [],
+          last.isSome() ? ago(v.now, last.unwrap().startedAt) : "",
+        ),
+      ],
+    ),
+    Card<Msg>("Runs over time", [], [BarChart<Msg>(spec)]),
+    FlushCard<Msg>(
+      "Recent runs",
+      [el<Msg>("a", [href<Msg>(appTabHref(v.detail.name, "runs"))], [text<Msg>("All runs")])],
+      [
+        RunsTable(
+          v.runs.slice(0, v.runs.length < 8 ? v.runs.length : 8),
+          false,
+          v.now,
+          "Nothing has run yet.",
+        ),
+      ],
+    ),
+  ]);
+}
+
+// ------------------------------------------------------------------ deployments and specs
+
+function specOf(d: Deployment): JsonValue {
+  const j = parseJson(d.spec);
+  return j.isSome() ? j.unwrap() : ValueNull;
+}
+
+// A value of a spec as the text a person reads; "" when the field is absent or null.
+function show(v: JsonValue): string {
+  return match (v) {
+    ValueNull => "",
+    ValueBool(b) => b ? "yes" : "no",
+    ValueString(s) => s,
+    ValueNumber(n) => jsonText(v),
+    ValueArray(xs) => xs.map(x => show(x)).join(", "),
+    ValueObject(ms) => jsonText(v),
+  };
+}
+
+function valueNode(label: string, v: JsonValue, fallback: string): Pair<Msg> {
+  const s = show(v);
+  return pair<Msg>(
+    label,
+    s.length == 0
+        ? el<Msg>("span", [cls<Msg>("ou-faint")], [text<Msg>(fallback)])
+        : el<Msg>("span", [cls<Msg>("ou-mono")], [text<Msg>(s)]),
+  );
+}
+
+// A number with a unit after it, or the fallback text when the field is absent.
+function unitNode(label: string, v: JsonValue, unit: string, fallback: string): Pair<Msg> {
+  const s = show(v);
+  if (s.length == 0) {
+    return valueNode(label, v, fallback);
+  }
+  return pair<Msg>(label, el<Msg>("span", [cls<Msg>("ou-mono")], [text<Msg>(s + unit)]));
+}
+
+function timeoutNode(v: JsonValue): Pair<Msg> {
+  const ms = asInt(v);
+  if (ms.isNone()) {
+    return valueNode("Timeout", v, "60 s for jobs and consumers, none for services");
+  }
+  return pair<Msg>(
+    "Timeout",
+    el<Msg>(
+      "span",
+      [cls<Msg>("ou-mono")],
+      [
+        text<Msg>(
+          ms.unwrap() == 0
+              ? "none"
+              : ms.unwrap() % 1000 == 0
+                  ? (ms.unwrap() / 1000).toString() + " s"
+                  : duration(ms.unwrap() * 1000),
+        ),
+      ],
+    ),
+  );
+}
+
+function SpecGroups(spec: JsonValue): Node<Msg> {
+  const limits = member(spec, "limits");
+  const env = member(spec, "env");
+  let envRows: Pair<Msg>[] = [];
+  match (env) {
+    ValueObject(ms) => {
+      for (const e of ms) {
+        envRows.push(
+          pair<Msg>(e.key, el<Msg>("span", [cls<Msg>("ou-mono")], [text<Msg>(show(e.value))])),
+        );
+      }
+    },
+    _ => {},
+  }
+  if (envRows.length == 0) {
+    envRows.push(
+      pair<Msg>("Variables", el<Msg>("span", [cls<Msg>("ou-faint")], [text<Msg>("none")])),
+    );
+  }
+  return Grid<Msg>(
+    2,
+    [
+      Stack<Msg>([
+        KeyValueGroup<Msg>(
+          "General",
+          [
+            valueNode("Kind", member(spec, "kind"), "job"),
+            valueNode("Entry point", member(spec, "entry"), "_start or orin_main"),
+            valueNode("Arguments", member(spec, "args"), "none"),
+            valueNode("Restart policy", member(spec, "restart"), "always"),
+            valueNode("Queue", member(spec, "queue"), "-"),
+            valueNode("Max attempts", member(spec, "max_attempts"), "5"),
+          ],
+        ),
+        KeyValueGroup<Msg>(
+          "Limits",
+          [
+            unitNode("Memory", member(limits, "memory_mb"), " MiB", "64 MiB"),
+            timeoutNode(member(limits, "timeout_ms")),
+            valueNode("Fuel", member(limits, "fuel"), "unmetered"),
+          ],
+        ),
+      ]),
+      Stack<Msg>([
+        KeyValueGroup<Msg>(
+          "Capabilities",
+          [
+            valueNode("KV namespaces", member(spec, "kv_namespaces"), "none"),
+            valueNode("Listen", member(spec, "listen"), "none"),
+            valueNode("Connect", member(spec, "connect"), "none"),
+            valueNode("Files", member(spec, "files"), "no"),
+            valueNode("Clock", member(spec, "clock"), "yes"),
+            valueNode("Random", member(spec, "random"), "yes"),
+          ],
+        ),
+        KeyValueGroup<Msg>("Environment", envRows),
+      ]),
+    ],
+  );
+}
+
+type Flat = { path: string; value: string; };
+
+// The spec flattened to (path, text) pairs: nested objects become dotted paths.
+function flatten(prefix: string, v: JsonValue): Flat[] {
+  return match (v) {
+    ValueObject(ms) => {
+      let out: Flat[] = [];
+      for (const m of ms) {
+        for (const f of flatten(prefix.length == 0 ? m.key : prefix + "." + m.key, m.value)) {
+          out.push(f);
+        }
+      }
+      return out;
+    },
+    _ => [Flat { path: prefix, value: show(v) }],
+  };
+}
+
+function lookup(fs: Flat[], path: string): Option<string> {
+  for (const f of fs) {
+    if (f.path == path) {
+      return Some(f.value);
+    }
+  }
+  return None;
+}
+
+function shown(s: Option<string>): string {
+  return s.isNone() ? "(absent)" : s.unwrap().length == 0 ? "(default)" : s.unwrap();
+}
+
+// The fields that differ between two specs: path, before, after.
+export type Change = { path: string; before: string; after: string; };
+
+export function specChanges(before: JsonValue, after: JsonValue): Change[] {
+  const a = flatten("", before);
+  const b = flatten("", after);
+  let paths: string[] = [];
+  for (const f of a) {
+    paths.push(f.path);
+  }
+  for (const f of b) {
+    if (!paths.includes(f.path)) {
+      paths.push(f.path);
+    }
+  }
+  let out: Change[] = [];
+  for (const p of paths) {
+    const x = lookup(a, p);
+    const y = lookup(b, p);
+    if (shown(x) != shown(y)) {
+      out.push(Change { path: p, before: shown(x), after: shown(y) });
+    }
+  }
+  return out;
+}
+
+// The deployment that came right before `d` (lower version, highest of them).
+function previousOf(ds: Deployment[], d: Deployment): Option<Deployment> {
+  let best: Option<Deployment> = None;
+  for (const x of ds) {
+    if (x.version < d.version && (best.isNone() || x.version > best.unwrap().version)) {
+      best = Some(x);
+    }
+  }
+  return best;
+}
+
+function findDeployment(ds: Deployment[], id: int): Option<Deployment> {
+  for (const x of ds) {
+    if (x.id == id) {
+      return Some(x);
+    }
+  }
+  return None;
+}
+
+function DiffCard(v: AppData, id: int): Node<Msg> {
+  const d = findDeployment(v.detail.deployments, id);
+  if (d.isNone()) {
+    return nothing<Msg>();
+  }
+  const prev = previousOf(v.detail.deployments, d.unwrap());
+  const title = prev.isSome()
+      ? "Version " + prev.unwrap().version.toString() + " to version "
+          + d.unwrap().version.toString()
+      : "Version " + d.unwrap().version.toString();
+  let changes: Change[] = [];
+  if (prev.isSome()) {
+    changes = specChanges(specOf(prev.unwrap()), specOf(d.unwrap()));
+  }
+  const moduleChanged = prev.isSome() && prev.unwrap().module != d.unwrap().module;
+  return Card<Msg>(
+    "Changes: " + title,
+    [Button<Msg>("Close", ButtonGhost, HideDiff)],
+    [
+      prev.isNone()
+          ? el<Msg>(
+            "p",
+            [cls<Msg>("ou-muted")],
+            [text<Msg>("This is the first version: there is nothing to compare it with.")],
+          )
+          : Stack<Msg>([
+            el<Msg>(
+              "p",
+              [cls<Msg>("ou-muted")],
+              [
+                text<Msg>(
+                  moduleChanged
+                      ? "The module changed (" + clip(prev.unwrap().module, 12) + " to "
+                          + clip(d.unwrap().module, 12) + ")."
+                      : "The module is the same; only the settings changed.",
+                ),
+              ],
+            ),
+            Table<Msg>(
+              [column("path", "Setting"), column("before", "Before"), column("after", "After")],
+              changes.map(
+                c => tableRow<Msg>(
+                  c.path,
+                  [
+                    Mono<Msg>(c.path),
+                    el<Msg>("span", [cls<Msg>("ou-diff-old")], [text<Msg>(c.before)]),
+                    el<Msg>("span", [cls<Msg>("ou-diff-new")], [text<Msg>(c.after)]),
+                  ],
+                ),
+              ),
+              unsorted(),
+              noop,
+              EmptyState<Msg>(
+                "check",
+                "No setting changed",
+                "Both versions have the same spec.",
+                [],
+              ),
+            ),
+          ]),
+    ],
+  );
+}
+
+function DeploymentRow(v: AppData, d: Deployment): TableRow<Msg> {
+  const active = d.id == v.detail.activeDeployment;
+  return tableRow<Msg>(
+    d.id.toString(),
+    [
+      el<Msg>("strong", [], [text<Msg>("v" + d.version.toString())]),
+      active
+          ? StatusPill<Msg>("active")
+          : el<Msg>("span", [cls<Msg>("ou-faint")], [text<Msg>("inactive")]),
+      Mono<Msg>(clip(d.module, 12)),
+      el<Msg>("span", [cls<Msg>("ou-muted")], [text<Msg>(dateTime(d.createdAt))]),
+      Inline<Msg>([
+        SmallButton<Msg>("Compare", ButtonGhost, ShowDiff(d.id)),
+        active
+            ? el<Msg>("span", [], [])
+            : SmallButton<Msg>("Activate", ButtonSecondary, OpenDialog(ConfirmActivate(d.id))),
+      ]),
+    ],
+  );
+}
+
+function activeDeployment(v: AppData): Option<Deployment> {
+  return findDeployment(v.detail.deployments, v.detail.activeDeployment);
+}
+
+function newestFirst(ds: Deployment[]): Deployment[] {
+  return ds.sort((a: Deployment, b: Deployment): int => b.version - a.version);
+}
+
+function DeploymentsTab(v: AppData): Node<Msg> {
+  const shownId = v.diff.isSome() ? v.diff.unwrap() : v.detail.activeDeployment;
+  const current = findDeployment(v.detail.deployments, shownId);
+  const spec = current.isSome() ? specOf(current.unwrap()) : ValueNull;
+  return Stack<Msg>([
+    FlushCard<Msg>(
+      "Versions",
+      [],
+      [
+        Table<Msg>(
+          [
+            column("v", "Version"),
+            column("state", "State"),
+            column("module", "Module"),
+            column("created", "Created"),
+            column("actions", ""),
+          ],
+          newestFirst(v.detail.deployments).map(d => DeploymentRow(v, d)),
+          unsorted(),
+          noop,
+          EmptyState<Msg>("apps", "No deployments", "", []),
+        ),
+      ],
+    ),
+    v.diff.isSome() ? DiffCard(v, v.diff.unwrap()) : nothing<Msg>(),
+    Card<Msg>(
+      current.isSome()
+          ? "Configuration of version " + current.unwrap().version.toString()
+          : "Configuration",
+      [Toggle<Msg>("Raw JSON", v.showRaw, ToggleRaw)],
+      [
+        v.showRaw
+            ? JsonText<Msg>(current.isSome() ? current.unwrap().spec : "{}")
+            : SpecGroups(spec),
+      ],
+    ),
+  ]);
+}
+
+function RunsTab(v: AppData): Node<Msg> {
+  return FlushCard<Msg>("Runs", [], [RunsTable(v.runs, false, v.now, "Nothing has run yet.")]);
+}
+
+function KvTab(v: AppData): Node<Msg> {
+  if (v.namespaces.length == 0) {
+    return Card<Msg>(
+      "",
+      [],
+      [
+        EmptyState<Msg>(
+          "kv",
+          "No KV data",
+          "This app has no KV namespaces. Grant one at deploy time: occtl deploy NAME app.wasm --kv NAME.",
+          [],
+        ),
+      ],
+    );
+  }
+  const open = v.kv.isSome() ? v.kv.unwrap().namespace : "";
+  const list = Card<Msg>(
+    "Namespaces",
+    [],
+    [
+      Stack<Msg>(
+        v.namespaces.map(
+          n => el<Msg>(
+            "button",
+            [
+              key<Msg>(n.namespace),
+              cls<Msg>(n.namespace == open ? "ou-listbtn active" : "ou-listbtn"),
+              attr<Msg>("type", "button"),
+              onClickShow(n.namespace),
+            ],
+            [
+              el<Msg>("span", [cls<Msg>("ou-mono")], [text<Msg>(n.namespace)]),
+              Badge<Msg>(
+                n.entries.toString() + (n.entries == 1 ? " entry" : " entries"),
+                ToneNeutral,
+              ),
+            ],
+          ),
+        ),
+      ),
+    ],
+  );
+  if (v.kv.isNone()) {
+    return Grid<Msg>(
+      2,
+      [
+        list,
+        Card<Msg>(
+          "",
+          [],
+          [EmptyState<Msg>("kv", "Choose a namespace", "Its entries appear here.", [])],
+        ),
+      ],
+    );
+  }
+  const kv = v.kv.unwrap();
+  let selected: Option<KvEntry> = None;
+  for (const e of kv.entries) {
+    if (e.key == v.selectedKey) {
+      selected = Some(e);
+    }
+  }
+  return Grid<Msg>(
+    2,
+    [
+      list,
+      Stack<Msg>([
+        FlushCard<Msg>(
+          kv.namespace,
+          [Button<Msg>("Close", ButtonGhost, HideKv)],
+          [
+            Table<Msg>(
+              [column("key", "Key"), column("size", "Size"), column("actions", "")],
+              kv.entries.map(
+                e => tableRow<Msg>(
+                  e.key,
+                  [
+                    Mono<Msg>(e.key),
+                    text<Msg>(e.size.toString() + " B"),
+                    SmallButton<Msg>(
+                      e.key == v.selectedKey ? "Viewing" : "View",
+                      ButtonGhost,
+                      SelectKey(e.key),
+                    ),
+                  ],
+                ),
+              ),
+              unsorted(),
+              noop,
+              EmptyState<Msg>("kv", "No entries", "", []),
+            ),
+          ],
+        ),
+        selected.isSome()
+            ? Card<Msg>(
+              selected.unwrap().key,
+              [Badge<Msg>(selected.unwrap().size.toString() + " B", ToneNeutral)],
+              [JsonText<Msg>(selected.unwrap().value)],
+            )
+            : nothing<Msg>(),
+      ]),
+    ],
+  );
+}
+
+function onClickShow(ns: string): Attr<Msg> {
+  return onClick<Msg>(ShowKv(ns));
+}
+
+function SettingsTab(v: AppData): Node<Msg> {
+  const d = v.detail;
+  const active = activeDeployment(v);
+  return Stack<Msg>([
+    Card<Msg>(
+      "About this app",
+      [],
+      [
+        KeyValue<Msg>([
+          textPair<Msg>("Name", d.name),
+          textPair<Msg>("Kind", d.kind),
+          textPair<Msg>("Created", dateTime(d.createdAt)),
+          textPair<Msg>(
+            "Active version",
+            active.isSome() ? "v" + active.unwrap().version.toString() : "-",
+          ),
+          pair<Msg>("Module", active.isSome() ? Mono<Msg>(active.unwrap().module) : text<Msg>("-")),
+        ]),
+      ],
+    ),
+    el<Msg>(
+      "section",
+      [cls<Msg>("ou-card ou-danger-zone")],
+      [
+        el<Msg>(
+          "div",
+          [cls<Msg>("ou-card-header")],
+          [el<Msg>("h2", [cls<Msg>("ou-card-title")], [text<Msg>("Danger zone")])],
+        ),
+        el<Msg>(
+          "div",
+          [cls<Msg>("ou-card-body ou-spread")],
+          [
+            el<Msg>(
+              "div",
+              [],
+              [
+                el<Msg>("strong", [], [text<Msg>("Delete this app")]),
+                el<Msg>(
+                  "p",
+                  [cls<Msg>("ou-muted")],
+                  [
+                    text<Msg>(
+                      "Stops its worker and deletes its deployments, runs, logs, KV data and files.",
+                    ),
+                  ],
+                ),
+              ],
+            ),
+            Button<Msg>("Delete app", ButtonDanger, OpenDialog(ConfirmDelete)),
+          ],
+        ),
+      ],
+    ),
+  ]);
+}
+
+export function AppView(m: Model, v: AppData): Node<Msg> {
+  const d = v.detail;
+  const active = activeDeployment(v);
+  const description = d.kind
+      + (active.isSome() ? " - version " + active.unwrap().version.toString() + " is active" : "")
+      + " - created " + dateTime(d.createdAt);
+  let actions: Node<Msg>[] = [IconLabelButton<Msg>("refresh", "Refresh", ButtonSecondary, Refresh)];
+  if (d.kind != "service") {
+    actions.push(IconLabelButton<Msg>("play", "Run now", ButtonPrimary, RunNow));
+  }
+  const body = match (v.tab) {
+    TabOverview => OverviewTab(v),
+    TabDeployments => DeploymentsTab(v),
+    TabRuns => RunsTab(v),
+    TabLogs => LogsBody(m, true),
+    TabKv => KvTab(v),
+    TabSettings => SettingsTab(v),
+  };
+  return Stack<Msg>([
+    PageHeader<Msg>(
+      d.name,
+      description,
+      [Crumb { label: "Apps", href: "/apps" }, Crumb { label: d.name, href: "" }],
+      actions,
+    ),
+    tabs(v),
+    body,
+  ]);
+}

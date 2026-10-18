@@ -1,0 +1,39 @@
+// A check that the console's portable core builds and runs for wasm32-orbit: the decoders, the effects, the model and the views (with
+// the orin-ui kit and its SVG charts), driven by a canned Api, printing the first screen as HTML. It uses no std:net and no std:fs,
+// unlike main.or (see README: "WebAssembly"). Build it with `orin build --target=wasm32-orbit tools/wasm_check.or`.
+import { Api, ApiRequest, ApiResponse } from "../src/api";
+import { RouteApps, RouteOverview, loadModel } from "../src/effects";
+import { Model, Msg, ToggleFollow, update } from "../src/model";
+import { program } from "../src/program";
+import { sessionOf, send, renderHtml, patchMessageSeq } from "orin-ui";
+
+function bucket(t: int, ok: int): string {
+  return "{\"t\":" + t.toString() + ",\"succeeded\":" + ok.toString() + ",\"failed\":0,\"running\":0,\"p50_us\":900,\"p95_us\":2400,\"logs\":1}";
+}
+
+function canned(): Api {
+  return (req: ApiRequest): Result<ApiResponse, string> => {
+    if (req.path == "/v1/apps") {
+      return Ok(ApiResponse { status: 200, body: "[{\"name\":\"hello\",\"kind\":\"job\",\"version\":1,\"worker_running\":false,\"created_at\":1792336579470}]" });
+    }
+    if (req.path.startsWith("/v1/stats")) {
+      return Ok(ApiResponse { status: 200, body: "{\"since\":0,\"until\":7200000,\"bucket_ms\":3600000,\"buckets\":[" + bucket(0, 3) + "," + bucket(3600000, 5) + "],\"totals\":" + bucket(0, 8) + "}" });
+    }
+    if (req.path == "/v1/runs?limit=200" || req.path == "/v1/runs?limit=100" || req.path == "/v1/queues") {
+      return Ok(ApiResponse { status: 200, body: "[]" });
+    }
+    if (req.path == "/v1/node") {
+      return Ok(ApiResponse { status: 200, body: "{\"kinds\":[\"job\"],\"orbit_abi\":1,\"version\":\"0.1.0\",\"workers\":[]}" });
+    }
+    return Ok(ApiResponse { status: 404, body: "{\"error\":\"not found\"}" });
+  };
+}
+
+function main(): void {
+  const m = loadModel(canned(), RouteOverview, "orbitd:8080").unwrap();
+  const s = sessionOf<Model, Msg>(program(), m);
+  console.log(renderHtml(s.dom));
+  const apps = loadModel(canned(), RouteApps, "orbitd:8080").unwrap();
+  const next = send<Model, Msg>(program(), sessionOf<Model, Msg>(program(), apps), ToggleFollow);
+  console.log(patchMessageSeq(next.patches, 0));
+}

@@ -1,0 +1,4 @@
+// A queue consumer that handles its message and acknowledges it (exit status 0).
+function main(): void {
+  console.log("mailer: delivered a message");
+}

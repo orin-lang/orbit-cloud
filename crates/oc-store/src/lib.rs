@@ -114,6 +114,9 @@ pub struct Run {
     pub finished_at: Option<i64>,
     /// Wall time of the execution in milliseconds.
     pub wall_ms: Option<i64>,
+    /// Wall time of the execution in microseconds (runs recorded before this field existed have none).
+    #[serde(default)]
+    pub wall_us: Option<i64>,
     /// Fuel consumed, when metering is on.
     pub fuel: Option<i64>,
     /// Peak linear memory in bytes.
@@ -124,6 +127,40 @@ pub struct Run {
     pub trace_id: String,
     /// The queue message that triggered it.
     pub message_id: Option<i64>,
+}
+
+/// One time bucket of [`Stats`] (also used for the totals, whose `t` is the start of the range).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatsBucket {
+    /// Start of the bucket (Unix ms).
+    pub t: i64,
+    /// Runs that succeeded and started in the bucket.
+    pub succeeded: i64,
+    /// Runs that failed.
+    pub failed: i64,
+    /// Runs still running.
+    pub running: i64,
+    /// Median run time in microseconds.
+    pub p50_us: Option<i64>,
+    /// 95th percentile of the run time in microseconds.
+    pub p95_us: Option<i64>,
+    /// Log lines written in the bucket.
+    pub logs: i64,
+}
+
+/// Run statistics over a time range, see [`Store::stats`].
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Stats {
+    /// Start of the range (Unix ms, inclusive).
+    pub since: i64,
+    /// End of the range (exclusive).
+    pub until: i64,
+    /// Bucket width in milliseconds.
+    pub bucket_ms: i64,
+    /// One entry per bucket, oldest first, empty buckets included.
+    pub buckets: Vec<StatsBucket>,
+    /// The whole range in one bucket.
+    pub totals: StatsBucket,
 }
 
 /// The outcome recorded when a run ends.
@@ -137,6 +174,8 @@ pub struct RunOutcome {
     pub error: Option<String>,
     /// Wall time in milliseconds.
     pub wall_ms: Option<i64>,
+    /// Wall time in microseconds.
+    pub wall_us: Option<i64>,
     /// Fuel consumed.
     pub fuel: Option<i64>,
     /// Peak linear memory in bytes.
@@ -308,6 +347,7 @@ fn run_from_row(r: &Row<'_>) -> rusqlite::Result<Run> {
         started_at: r.get("started_at")?,
         finished_at: r.get("finished_at")?,
         wall_ms: r.get("wall_ms")?,
+        wall_us: r.get("wall_us")?,
         fuel: r.get("fuel")?,
         peak_memory: r.get("peak_memory")?,
         host_calls: calls.and_then(|c| serde_json::from_str(&c).ok()),
@@ -373,6 +413,13 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        // Databases created before `wall_us` existed get the column (NULL for their old runs).
+        let has_wall_us = conn
+            .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'wall_us'")?
+            .exists([])?;
+        if !has_wall_us {
+            conn.execute_batch("ALTER TABLE runs ADD COLUMN wall_us INTEGER")?;
+        }
         conn.execute(
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?1)",
             params![SCHEMA_VERSION],
@@ -647,6 +694,7 @@ impl Store {
             started_at: now_ms(),
             finished_at: None,
             wall_ms: None,
+            wall_us: None,
             fuel: None,
             peak_memory: None,
             host_calls: None,
@@ -668,7 +716,7 @@ impl Store {
     pub fn finish_run(&self, id: &str, o: &RunOutcome) -> Result<()> {
         let n = self.db().execute(
             "UPDATE runs SET status = ?2, exit_code = ?3, error = ?4, finished_at = ?5, wall_ms = ?6, fuel = ?7,
-               peak_memory = ?8, host_calls = ?9 WHERE id = ?1",
+               peak_memory = ?8, host_calls = ?9, wall_us = ?10 WHERE id = ?1",
             params![
                 id,
                 o.status,
@@ -678,7 +726,8 @@ impl Store {
                 o.wall_ms,
                 o.fuel,
                 o.peak_memory,
-                o.host_calls.as_ref().map(serde_json::Value::to_string)
+                o.host_calls.as_ref().map(serde_json::Value::to_string),
+                o.wall_us
             ],
         )?;
         if n == 0 {
@@ -714,6 +763,133 @@ impl Store {
         )?;
         let rows = st.query_map(params![app, limit], run_from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Run counts, run-time percentiles and log counts per time bucket, for charts. `since` (inclusive) and `until`
+    /// (exclusive) are Unix milliseconds, `bucket_ms` the bucket width; every bucket in the range is returned, empty ones
+    /// with zero counts. Run time is `wall_us`, or `wall_ms` of runs that predate it, in microseconds. Percentiles are
+    /// nearest-rank and `None` for a bucket without finished runs.
+    ///
+    /// # Errors
+    /// [`StoreError::Conflict`] for an empty range, a bucket under 1 s, or more than 1000 buckets; [`StoreError::Db`].
+    pub fn stats(
+        &self,
+        since: i64,
+        until: i64,
+        bucket_ms: i64,
+        app: Option<&str>,
+    ) -> Result<Stats> {
+        if until <= since || bucket_ms < 1000 || (until - since + bucket_ms - 1) / bucket_ms > 1000
+        {
+            return Err(StoreError::Conflict(
+                "stats needs since < until, a bucket of at least 1000 ms and at most 1000 buckets"
+                    .into(),
+            ));
+        }
+        let n = usize::try_from((until - since + bucket_ms - 1) / bucket_ms).unwrap_or(0);
+        let mut buckets: Vec<StatsBucket> = (0..n)
+            .map(|i| StatsBucket {
+                t: since + i64::try_from(i).unwrap_or(0) * bucket_ms,
+                ..StatsBucket::default()
+            })
+            .collect();
+        let db = self.db();
+        let index = |b: i64| usize::try_from(b).ok().filter(|i| *i < n);
+        {
+            let mut st = db.prepare(
+                "SELECT (started_at - ?1) / ?3 AS b, status, COUNT(*) FROM runs
+                 WHERE started_at >= ?1 AND started_at < ?2 AND (?4 IS NULL OR app = ?4) GROUP BY b, status",
+            )?;
+            let rows = st.query_map(params![since, until, bucket_ms, app], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (b, status, count) = row?;
+                if let Some(i) = index(b) {
+                    match status.as_str() {
+                        "succeeded" => buckets[i].succeeded = count,
+                        "failed" => buckets[i].failed = count,
+                        _ => buckets[i].running += count,
+                    }
+                }
+            }
+        }
+        // Nearest-rank percentiles with window functions: the smallest duration whose rank is at least p% of the count.
+        let percentiles = |group: &str| {
+            format!(
+                "WITH r AS (SELECT {group} AS b, COALESCE(wall_us, wall_ms * 1000) AS d FROM runs
+                            WHERE started_at >= ?1 AND started_at < ?2 AND (?4 IS NULL OR app = ?4)),
+                      k AS (SELECT b, d, ROW_NUMBER() OVER (PARTITION BY b ORDER BY d) AS rn,
+                                   COUNT(*) OVER (PARTITION BY b) AS n FROM r WHERE d IS NOT NULL)
+                 SELECT b, MIN(CASE WHEN rn * 100 >= 50 * n THEN d END), MIN(CASE WHEN rn * 100 >= 95 * n THEN d END)
+                 FROM k GROUP BY b"
+            )
+        };
+        {
+            let mut st = db.prepare(&percentiles("(started_at - ?1) / ?3"))?;
+            let rows = st.query_map(params![since, until, bucket_ms, app], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Option<i64>>(1)?,
+                    r.get::<_, Option<i64>>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (b, p50, p95) = row?;
+                if let Some(i) = index(b) {
+                    buckets[i].p50_us = p50;
+                    buckets[i].p95_us = p95;
+                }
+            }
+        }
+        let mut totals = StatsBucket {
+            t: since,
+            ..StatsBucket::default()
+        };
+        {
+            let mut st = db.prepare(&percentiles("0"))?;
+            let row = st
+                .query_row(params![since, until, bucket_ms, app], |r| {
+                    Ok((r.get::<_, Option<i64>>(1)?, r.get::<_, Option<i64>>(2)?))
+                })
+                .optional()?;
+            if let Some((p50, p95)) = row {
+                totals.p50_us = p50;
+                totals.p95_us = p95;
+            }
+        }
+        {
+            let mut st = db.prepare(
+                "SELECT (ts - ?1) / ?3 AS b, COUNT(*) FROM logs
+                 WHERE ts >= ?1 AND ts < ?2 AND (?4 IS NULL OR app = ?4) GROUP BY b",
+            )?;
+            let rows = st.query_map(params![since, until, bucket_ms, app], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))
+            })?;
+            for row in rows {
+                let (b, count) = row?;
+                if let Some(i) = index(b) {
+                    buckets[i].logs = count;
+                }
+            }
+        }
+        for b in &buckets {
+            totals.succeeded += b.succeeded;
+            totals.failed += b.failed;
+            totals.running += b.running;
+            totals.logs += b.logs;
+        }
+        Ok(Stats {
+            since,
+            until,
+            bucket_ms,
+            buckets,
+            totals,
+        })
     }
 
     /// Counts of runs by app and status (for metrics).
@@ -1346,5 +1522,114 @@ mod tests {
             s.kv_get("a", "n", b"k").unwrap().as_deref(),
             Some(&b"v"[..])
         );
+    }
+
+    fn old_run(s: &Store, app: &str, at: i64, status: &str, us: Option<i64>, ms: Option<i64>) {
+        let r = s.start_run(app, 1, "api", None).unwrap();
+        s.db()
+            .execute(
+                "UPDATE runs SET started_at = ?2, status = ?3, wall_us = ?4, wall_ms = ?5 WHERE id = ?1",
+                params![r.id, at, status, us, ms],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn stats_buckets_counts_and_percentiles() {
+        let s = store();
+        // bucket 0 (t 0..60_000): ten runs of 1..=10 ms, one failed; bucket 2: one running run; bucket 1 stays empty
+        for i in 1..=10 {
+            let status = if i == 3 { "failed" } else { "succeeded" };
+            old_run(&s, "a", 1000 * i, status, Some(i * 1000), None);
+        }
+        old_run(&s, "a", 125_000, "running", None, None);
+        old_run(&s, "b", 5000, "succeeded", Some(777_000), None);
+        s.append_logs(&[NewLog {
+            ts: 61_000,
+            app: "a".into(),
+            run_id: None,
+            level: "info".into(),
+            message: "x".into(),
+        }])
+        .unwrap();
+        let st = s.stats(0, 180_000, 60_000, Some("a")).unwrap();
+        assert_eq!(st.buckets.len(), 3, "every bucket is present");
+        let b0 = &st.buckets[0];
+        assert_eq!((b0.t, b0.succeeded, b0.failed, b0.running), (0, 9, 1, 0));
+        assert_eq!(
+            (b0.p50_us, b0.p95_us),
+            (Some(5000), Some(10_000)),
+            "nearest rank"
+        );
+        assert_eq!(
+            st.buckets[1],
+            StatsBucket {
+                t: 60_000,
+                logs: 1,
+                ..StatsBucket::default()
+            }
+        );
+        assert_eq!(st.buckets[2].running, 1);
+        assert_eq!(st.buckets[2].p95_us, None, "no finished run, no percentile");
+        assert_eq!(
+            st.totals.succeeded + st.totals.failed + st.totals.running,
+            11
+        );
+        assert_eq!(st.totals.p95_us, Some(10_000));
+        // all apps: the 777 ms run is the slowest
+        let all = s.stats(0, 180_000, 60_000, None).unwrap();
+        assert_eq!(all.totals.p95_us, Some(777_000));
+        assert_eq!(all.buckets[0].succeeded, 10);
+    }
+
+    #[test]
+    fn stats_falls_back_to_wall_ms_and_rejects_bad_ranges() {
+        let s = store();
+        old_run(&s, "a", 10, "succeeded", None, Some(3));
+        let st = s.stats(0, 1000, 1000, None).unwrap();
+        assert_eq!(
+            st.totals.p50_us,
+            Some(3000),
+            "milliseconds become microseconds"
+        );
+        assert!(s.stats(5, 5, 1000, None).is_err());
+        assert!(s.stats(0, 1000, 999, None).is_err());
+        assert!(
+            s.stats(0, 1_001_000, 1000, None).is_err(),
+            "more than 1000 buckets"
+        );
+        let empty = s.stats(2000, 4000, 1000, None).unwrap();
+        assert_eq!(empty.totals.succeeded, 0);
+        assert_eq!(empty.totals.p95_us, None);
+    }
+
+    #[test]
+    fn a_database_without_wall_us_is_migrated() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (id TEXT PRIMARY KEY, app TEXT NOT NULL, deployment INTEGER NOT NULL, trigger TEXT NOT NULL,
+               status TEXT NOT NULL, exit_code INTEGER, error TEXT, started_at INTEGER NOT NULL, finished_at INTEGER,
+               wall_ms INTEGER, fuel INTEGER, peak_memory INTEGER, host_calls TEXT, trace_id TEXT NOT NULL, message_id INTEGER);
+             INSERT INTO runs (id, app, deployment, trigger, status, started_at, wall_ms, trace_id)
+               VALUES ('old', 'a', 1, 'api', 'succeeded', 5, 7, 't');",
+        )
+        .unwrap();
+        let s = Store::init(conn).unwrap();
+        let r = s.run("old").unwrap();
+        assert_eq!(
+            (r.wall_ms, r.wall_us),
+            (Some(7), None),
+            "old rows keep their data"
+        );
+        s.finish_run(
+            &s.start_run("a", 1, "api", None).unwrap().id,
+            &RunOutcome {
+                status: "succeeded".into(),
+                wall_us: Some(42),
+                ..RunOutcome::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(s.runs(None, 1).unwrap()[0].wall_us, Some(42));
     }
 }

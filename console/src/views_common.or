@@ -1,0 +1,399 @@
+// Pieces shared by the screens: the application shell, the run table, log lines and small helpers.
+import {
+  Node, Attr, el, text, cls, attr, href, key, nothing, AppShell, Sidebar, TopBar, NavItem,
+  NavSection, Badge, Tone, ToneSuccess, ToneDanger, ToneWarning, ToneInfo, ToneNeutral, ToneAccent,
+  ThemeToggle, Menu, PostForm, Icon, Toast, ConfirmDialog, Dialog, Button, ButtonPrimary,
+  ButtonSecondary, ButtonDanger, ButtonGhost, Form, TextField, TextArea, SubmitButton, StatusPill,
+  Table, column, sortableColumn, tableRow, TableRow, unsorted, Inline, Stack, EmptyState, Banner,
+  Mono, Sparkline,
+} from "orin-ui";
+import { seg } from "./api";
+import { Run, LogLine } from "./types";
+import {
+  Model, Msg, Page, Flash, Dialog as DialogState, NoDialog, ConfirmActivate, ConfirmDelete,
+  PublishDialog, Noop, CloseDialog, DismissFlash, ActivateConfirmed, DeleteForm, PublishForm,
+  OverviewPage, AppsPage, AppPage, RunsPage, RunPage, LogsPage, QueuesPage, KvPage, SettingsPage,
+  NoticePage, AppData,
+} from "./model";
+import { dateTime, timeOfDay, duration, runUs, ago, clip, optInt } from "./fmt";
+
+export function appHref(name: string): string {
+  return "/apps/" + seg(name);
+}
+
+export function appTabHref(name: string, tab: string): string {
+  return "/apps/" + seg(name) + "/" + tab;
+}
+
+export function runHref(id: string): string {
+  return "/runs/" + seg(id);
+}
+
+export function noop(v: string): Msg {
+  return Noop;
+}
+
+// ------------------------------------------------------------------ the brand
+
+// The Orbit Cloud mark: a planet on an orbit.
+export function Logo(): Node<Msg> {
+  return el<Msg>(
+    "svg",
+    [
+      cls<Msg>("ou-logo"),
+      attr<Msg>("viewBox", "0 0 24 24"),
+      attr<Msg>("fill", "none"),
+      attr<Msg>("aria-hidden", "true"),
+    ],
+    [
+      el<Msg>(
+        "circle",
+        [
+          attr<Msg>("cx", "12"),
+          attr<Msg>("cy", "12"),
+          attr<Msg>("r", "4.5"),
+          attr<Msg>("fill", "currentColor"),
+        ],
+        [],
+      ),
+      el<Msg>(
+        "ellipse",
+        [
+          attr<Msg>("cx", "12"),
+          attr<Msg>("cy", "12"),
+          attr<Msg>("rx", "10.5"),
+          attr<Msg>("ry", "4.2"),
+          attr<Msg>("transform", "rotate(-25 12 12)"),
+          attr<Msg>("stroke", "currentColor"),
+          attr<Msg>("stroke-width", "1.6"),
+        ],
+        [],
+      ),
+    ],
+  );
+}
+
+function Brand(): Node<Msg> {
+  return el<Msg>(
+    "a",
+    [href<Msg>("/"), attr<Msg>("aria-label", "Orbit Cloud overview")],
+    [Logo(), el<Msg>("span", [cls<Msg>("ou-wordmark")], [text<Msg>("Orbit Cloud")])],
+  );
+}
+
+// ------------------------------------------------------------------ the shell
+
+type Section = SecOverview | SecApps | SecRuns | SecLogs | SecQueues | SecKv | SecSettings;
+
+function sectionOf(p: Page): Section {
+  return match (p) {
+    OverviewPage(v) => SecOverview,
+    AppsPage(v) => SecApps,
+    AppPage(v) => SecApps,
+    RunsPage(v) => SecRuns,
+    RunPage(v) => SecRuns,
+    LogsPage => SecLogs,
+    QueuesPage(v) => SecQueues,
+    KvPage(v) => SecKv,
+    SettingsPage(v) => SecSettings,
+    NoticePage(a, b, c) => SecApps,
+  };
+}
+
+function isSec(a: Section, b: Section): bool {
+  return match (a) {
+    SecOverview => match (b) {
+      SecOverview => true,
+      _ => false,
+    },
+    SecApps => match (b) {
+      SecApps => true,
+      _ => false,
+    },
+    SecRuns => match (b) {
+      SecRuns => true,
+      _ => false,
+    },
+    SecLogs => match (b) {
+      SecLogs => true,
+      _ => false,
+    },
+    SecQueues => match (b) {
+      SecQueues => true,
+      _ => false,
+    },
+    SecKv => match (b) {
+      SecKv => true,
+      _ => false,
+    },
+    SecSettings => match (b) {
+      SecSettings => true,
+      _ => false,
+    },
+  };
+}
+
+function item(label: string, to: string, icon: string, here: Section, me: Section): NavItem {
+  return NavItem { label: label, href: to, icon: icon, active: isSec(here, me), badge: "" };
+}
+
+function SideNav(m: Model): Node<Msg> {
+  const here = sectionOf(m.page);
+  return Sidebar<Msg>(
+    Brand(),
+    [
+      NavSection { title: "", items: [item("Overview", "/", "overview", here, SecOverview)] },
+      NavSection {
+        title: "Platform",
+        items: [
+          item("Apps", "/apps", "apps", here, SecApps),
+          item("Runs", "/runs", "runs", here, SecRuns),
+          item("Logs", "/logs", "logs", here, SecLogs),
+          item("Queues", "/queues", "queues", here, SecQueues),
+          item("KV", "/kv", "kv", here, SecKv),
+        ],
+      },
+      NavSection {
+        title: "Account",
+        items: [item("Settings", "/settings", "settings", here, SecSettings)],
+      },
+    ],
+    el<Msg>(
+      "span",
+      [],
+      [text<Msg>(m.node.isSome() ? "orbitd " + m.node.unwrap().version : "orbitd")],
+    ),
+  );
+}
+
+function NodeStatus(m: Model): Node<Msg> {
+  if (m.node.isNone()) {
+    return el<Msg>(
+      "span",
+      [cls<Msg>("ou-nodestatus")],
+      [
+        Badge<Msg>("orbitd unreachable", ToneDanger),
+        el<Msg>("span", [cls<Msg>("ou-muted")], [text<Msg>(m.nodeLabel)]),
+      ],
+    );
+  }
+  const n = m.node.unwrap();
+  const workers = n.workers.length.toInt();
+  return el<Msg>(
+    "span",
+    [cls<Msg>("ou-nodestatus")],
+    [
+      Badge<Msg>("Online", ToneSuccess),
+      el<Msg>("span", [cls<Msg>("ou-nodename")], [text<Msg>(m.nodeLabel)]),
+      el<Msg>(
+        "span",
+        [cls<Msg>("ou-muted")],
+        [text<Msg>(workers.toString() + (workers == 1 ? " worker" : " workers"))],
+      ),
+    ],
+  );
+}
+
+function UserMenu(): Node<Msg> {
+  return Menu<Msg>(
+    Inline<Msg>([
+      el<Msg>("span", [cls<Msg>("ou-avatar")], [Icon<Msg>("user")]),
+      el<Msg>("span", [cls<Msg>("ou-user-label")], [text<Msg>("Operator")]),
+      Icon<Msg>("chevron-down"),
+    ]),
+    [
+      el<Msg>("div", [cls<Msg>("ou-menu-note")], [text<Msg>("Signed in with the console token")]),
+      PostForm<Msg>(
+        "/logout",
+        [
+          el<Msg>(
+            "button",
+            [cls<Msg>("ou-btn ou-btn-ghost"), attr<Msg>("type", "submit")],
+            [Icon<Msg>("log-out"), text<Msg>("Sign out")],
+          ),
+        ],
+      ),
+    ],
+  );
+}
+
+function TopRight(m: Model): Node<Msg>[] {
+  return [ThemeToggle<Msg>(), UserMenu()];
+}
+
+// The dialog that is open, if any.
+function OpenDialogView(m: Model): Node<Msg> {
+  return match (m.dialog) {
+    NoDialog => nothing<Msg>(),
+    ConfirmActivate(id) => ConfirmDialog<Msg>(
+      "Make this version active?",
+      [
+        el<Msg>(
+          "p",
+          [],
+          [
+            text<Msg>(
+              "Deployment " + id.toString()
+                  + " becomes the active version. A service or consumer is restarted on it at once; jobs use it for their next run.",
+            ),
+          ],
+        ),
+      ],
+      "Activate version",
+      false,
+      ActivateConfirmed(id),
+      CloseDialog,
+    ),
+    ConfirmDelete => DeleteDialog(m),
+    PublishDialog => PublishDialogView(m),
+  };
+}
+
+function appNameOf(m: Model): string {
+  return match (m.page) {
+    AppPage(v) => v.detail.name,
+    _ => "",
+  };
+}
+
+function DeleteDialog(m: Model): Node<Msg> {
+  const name = appNameOf(m);
+  return Dialog<Msg>(
+    "Delete " + name + "?",
+    [
+      Form<Msg>(
+        v => DeleteForm(v),
+        [
+          Banner<Msg>(
+            ToneDanger,
+            "This cannot be undone.",
+            "The app's deployments, runs, traces, logs, KV data and files are deleted, and its worker is stopped.",
+            [],
+          ),
+          TextField<Msg>("confirm", "Type " + name + " to confirm", "", "", name),
+          Inline<Msg>([
+            Button<Msg>("Cancel", ButtonSecondary, CloseDialog),
+            SubmitButton<Msg>("Delete app", ButtonDanger),
+          ]),
+        ],
+      ),
+    ],
+    [],
+    CloseDialog,
+  );
+}
+
+function PublishDialogView(m: Model): Node<Msg> {
+  return Dialog<Msg>(
+    "Publish a message",
+    [
+      Form<Msg>(
+        v => PublishForm(v),
+        [
+          TextField<Msg>(
+            "queue",
+            "Queue",
+            m.draftQueue,
+            "Lower case letters, digits and -. The queue is created if it does not exist.",
+            "orders",
+          ),
+          TextArea<Msg>("body", "Message", m.draftBody, "{\"id\": 1}"),
+          Inline<Msg>([
+            Button<Msg>("Cancel", ButtonSecondary, CloseDialog),
+            SubmitButton<Msg>("Publish", ButtonPrimary),
+          ]),
+        ],
+      ),
+    ],
+    [],
+    CloseDialog,
+  );
+}
+
+function FlashToast(f: Flash): Node<Msg> {
+  if (f.text.length == 0) {
+    return nothing<Msg>();
+  }
+  return Toast<Msg>(f.bad ? ToneDanger : ToneSuccess, f.text, f.href, DismissFlash);
+}
+
+// Shell(model, content) -- the whole screen around a page: sidebar, top bar, the page, and the dialog and toast layers.
+export function Shell(m: Model, content: Node<Msg>): Node<Msg> {
+  return el<Msg>(
+    "div",
+    [cls<Msg>("ou-app")],
+    [
+      AppShell<Msg>(SideNav(m), TopBar<Msg>([NodeStatus(m)], TopRight(m)), content),
+      OpenDialogView(m),
+      FlashToast(m.flash),
+    ],
+  );
+}
+
+// ------------------------------------------------------------------ shared tables and lines
+
+export function levelTone(l: string): Tone {
+  return match (l) {
+    "error" => ToneDanger,
+    "warn" => ToneWarning,
+    "info" => ToneInfo,
+    _ => ToneNeutral,
+  };
+}
+
+export function LogLineRow(l: LogLine, showApp: bool): Node<Msg> {
+  return el<Msg>(
+    "div",
+    [key<Msg>(l.id.toString()), cls<Msg>("logline lvl-" + l.level)],
+    [
+      el<Msg>("span", [cls<Msg>("ts")], [text<Msg>(timeOfDay(l.ts))]),
+      el<Msg>("span", [cls<Msg>("lvl")], [text<Msg>(l.level)]),
+      showApp ? el<Msg>("span", [cls<Msg>("app")], [text<Msg>(l.app)]) : nothing<Msg>(),
+      el<Msg>("span", [cls<Msg>("msg")], [text<Msg>(l.message)]),
+    ],
+  );
+}
+
+export function RunDuration(r: Run): string {
+  const us = runUs(r.wallUs, r.wallMs);
+  return us.isSome() ? duration(us.unwrap()) : "-";
+}
+
+function RunRow(r: Run, withApp: bool, now: int): TableRow<Msg> {
+  let cells: Node<Msg>[] = [
+    el<Msg>("a", [href<Msg>(runHref(r.id)), cls<Msg>("ou-mono")], [text<Msg>(r.id)]),
+  ];
+  if (withApp) {
+    cells.push(el<Msg>("a", [href<Msg>(appHref(r.app))], [text<Msg>(r.app)]));
+  }
+  cells.push(StatusPill<Msg>(r.status));
+  cells.push(text<Msg>(r.trigger));
+  cells.push(text<Msg>(RunDuration(r)));
+  cells.push(
+    el<Msg>(
+      "span",
+      [cls<Msg>("ou-muted"), attr<Msg>("title", dateTime(r.startedAt))],
+      [text<Msg>(ago(now, r.startedAt))],
+    ),
+  );
+  return TableRow<Msg> { key: r.id, cells: cells };
+}
+
+// RunsTable(runs, withApp, now) -- the table of runs; `withApp` adds the app column.
+export function RunsTable(runs: Run[], withApp: bool, now: int, emptyText: string): Node<Msg> {
+  let cols = [column("id", "Run")];
+  if (withApp) {
+    cols.push(column("app", "App"));
+  }
+  cols.push(column("status", "Status"));
+  cols.push(column("trigger", "Trigger"));
+  cols.push(column("time", "Execution"));
+  cols.push(column("started", "Started"));
+  return Table<Msg>(
+    cols,
+    runs.map(r => RunRow(r, withApp, now)),
+    unsorted(),
+    noop,
+    EmptyState<Msg>("runs", "No runs yet", emptyText, []),
+  );
+}

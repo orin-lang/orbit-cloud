@@ -1,0 +1,330 @@
+// The console as an orin-ui program: the model, the messages and `update`.
+//
+// `update` is pure. Messages come in two kinds: what the user did (RunNow, OpenDialog, ...), which `update` mostly ignores or turns
+// into plain UI state, and what the effects found out (Show, Notice, LinesArrived, ...), which `update` applies. The effects are in
+// effects.or: for a user message they call the API and return the second kind.
+import { parseQuery, FormSpace, PlusAsSpace } from "std:url";
+import { SortState, unsorted } from "orin-ui";
+import {
+  AppSummary, AppDetail, Run, Span, LogLine, KvNamespace, KvEntry, KvView, Queue, DeadView, Stats,
+  NodeInfo,
+} from "./types";
+
+// ------------------------------------------------------------------ pages
+
+export type AppTab = TabOverview | TabDeployments | TabRuns | TabLogs | TabKv | TabSettings;
+
+export type OverviewData = {
+  apps: AppSummary[];
+  stats: Stats;
+  previous: Stats;
+  queues: Queue[];
+  failed: Run[];
+  latest: Run[];
+  workers: int;
+};
+
+// One row of the apps table: the app, its newest run and its last 24 hours as a series of runs per bucket.
+export type AppRow = { app: AppSummary; last: Option<Run>; trend: int[]; runs24: int; };
+
+export type AppsData = { rows: AppRow[]; sort: SortState; now: int; };
+
+export type AppData = {
+  detail: AppDetail;
+  tab: AppTab;
+  runs: Run[];
+  stats: Stats;
+  namespaces: KvNamespace[];
+  kv: Option<KvView>;
+  selectedKey: string;
+  diff: Option<int>;
+  showRaw: bool;
+  now: int;
+};
+
+export type RunView = { run: Run; spans: Span[]; logs: LogLine[]; };
+
+export type RunsData = { runs: Run[]; now: int; };
+
+export type QueuesData = { queues: Queue[]; dead: Option<DeadView>; };
+
+// One namespace of one app in the KV overview.
+export type KvRow = { app: string; namespace: string; entries: int; };
+
+export type SettingsData = { node: Option<NodeInfo>; };
+
+export type Page =
+  OverviewPage(OverviewData)
+  | AppsPage(AppsData)
+  | AppPage(AppData)
+  | RunsPage(RunsData)
+  | RunPage(RunView)
+  | LogsPage
+  | QueuesPage(QueuesData)
+  | KvPage(KvRow[])
+  | SettingsPage(SettingsData)
+  | NoticePage(string, string, bool);
+
+// ------------------------------------------------------------------ the rest of the model
+
+// A line under the page: what the last action did. `href` is "" or a link target.
+export type Flash = { text: string; href: string; bad: bool; };
+
+export type Dialog = NoDialog | ConfirmActivate(int) | ConfirmDelete | PublishDialog;
+
+export type LogFilter = { app: string; level: string; contains: string; };
+
+export type LogState = {
+  filter: LogFilter;
+  following: bool;
+  lines: LogLine[];
+  lastId: int;
+  error: string;
+};
+
+export type Model = {
+  page: Page;
+  flash: Flash;
+  dialog: Dialog;
+  logs: LogState;
+  node: Option<NodeInfo>;
+  nodeLabel: string;
+  // The text of the publish form while its dialog is open, so a failed publish keeps what was typed.
+  draftQueue: string;
+  draftBody: string;
+};
+
+export type Msg =
+  Noop
+  | Refresh
+  | RunNow
+  | OpenDialog(Dialog)
+  | CloseDialog
+  | ActivateConfirmed(int)
+  | DeleteForm(string)
+  | PublishForm(string)
+  | ShowKv(string)
+  | SelectKey(string)
+  | HideKv
+  | Redrive(string)
+  | ShowDead(string)
+  | HideDead
+  | FilterForm(string)
+  | ToggleFollow
+  | ClearLines
+  | SortApps(string)
+  | ToggleRaw
+  | ShowDiff(int)
+  | HideDiff
+  | DismissFlash
+  | ClearDraft
+  | Show(Page)
+  | Notice(Flash)
+  | ShowKvEntries(KvView)
+  | ShowDeadLetters(DeadView)
+  | LinesArrived(LogLine[])
+  | StreamFailed(string);
+
+// The most lines the live log keeps; older ones scroll away.
+export function maxLines(): int {
+  return 500;
+}
+
+export function noFlash(): Flash {
+  return Flash { text: "", href: "", bad: false };
+}
+
+export function goodFlash(text: string, href: string): Flash {
+  return Flash { text: text, href: href, bad: false };
+}
+
+export function badFlash(text: string): Flash {
+  return Flash { text: text, href: "", bad: true };
+}
+
+export function emptyFilter(): LogFilter {
+  return LogFilter { app: "", level: "", contains: "" };
+}
+
+export function emptyLogs(): LogState {
+  return LogState { filter: emptyFilter(), following: false, lines: [], lastId: 0, error: "" };
+}
+
+export function initialModel(page: Page, node: Option<NodeInfo>, nodeLabel: string): Model {
+  return Model {
+    page: page,
+    flash: noFlash(),
+    dialog: NoDialog,
+    logs: emptyLogs(),
+    node: node,
+    nodeLabel: nodeLabel,
+    draftQueue: "",
+    draftBody: "",
+  };
+}
+
+// The value of a field of a url-encoded form body (the payload of a `submit` event), "" when absent.
+export function formField(encoded: string, name: string): string {
+  const pairs = parseQuery(encoded, PlusAsSpace);
+  if (pairs.isErr()) {
+    return "";
+  }
+  for (const p of pairs.unwrap()) {
+    if (p.key == name) {
+      return p.value;
+    }
+  }
+  return "";
+}
+
+export function filterFromForm(encoded: string): LogFilter {
+  return LogFilter {
+    app: formField(encoded, "app").trim(),
+    level: formField(encoded, "level"),
+    contains: formField(encoded, "contains"),
+  };
+}
+
+function withPage(m: Model, p: Page): Model {
+  return Model { ...m, page: p };
+}
+
+function withLogs(m: Model, l: LogState): Model {
+  return Model { ...m, logs: l };
+}
+
+function lastLine(lines: LogLine[], fallback: int): int {
+  let top = fallback;
+  for (const l of lines) {
+    if (l.id > top) {
+      top = l.id;
+    }
+  }
+  return top;
+}
+
+// Appends new lines, keeps the newest `maxLines()`.
+export function appendLines(s: LogState, fresh: LogLine[]): LogState {
+  let all = s.lines.concat(fresh);
+  const cap = maxLines().toUsize();
+  if (all.length > cap) {
+    all = all.slice(all.length - cap, all.length);
+  }
+  return LogState {
+    filter: s.filter,
+    following: s.following,
+    lines: all,
+    lastId: lastLine(fresh, s.lastId),
+    error: "",
+  };
+}
+
+function nextSort(s: SortState, key: string): SortState {
+  if (s.key == key) {
+    return SortState { key: key, desc: !s.desc };
+  }
+  return SortState { key: key, desc: false };
+}
+
+// The page's app data, if it is an app page.
+function appData(m: Model): Option<AppData> {
+  return match (m.page) {
+    AppPage(v) => Some(v),
+    _ => None,
+  };
+}
+
+function withApp(m: Model, f: (v: AppData) => AppData): Model {
+  return match (m.page) {
+    AppPage(v) => withPage(m, AppPage(f(v))),
+    _ => m,
+  };
+}
+
+export function update(m: Model, msg: Msg): Model {
+  return match (msg) {
+    Show(p) => withPage(m, p),
+    Notice(f) => Model { ...m, flash: f },
+    DismissFlash => Model { ...m, flash: noFlash() },
+    ClearDraft => Model { ...m, draftQueue: "", draftBody: "" },
+    OpenDialog(d) => Model { ...m, dialog: d },
+    CloseDialog => Model { ...m, dialog: NoDialog },
+    HideKv => withApp(m, v => AppData { ...v, kv: None, selectedKey: "" }),
+    ShowKvEntries(kv) => withApp(m, v => AppData { ...v, kv: Some(kv), selectedKey: "" }),
+    SelectKey(k) => withApp(m, v => AppData { ...v, selectedKey: k }),
+    ToggleRaw => withApp(m, v => AppData { ...v, showRaw: !v.showRaw }),
+    ShowDiff(id) => withApp(m, v => AppData { ...v, diff: Some(id) }),
+    HideDiff => withApp(m, v => AppData { ...v, diff: None }),
+    HideDead => match (m.page) {
+      QueuesPage(v) => withPage(m, QueuesPage(QueuesData { ...v, dead: None })),
+      _ => m,
+    },
+    ShowDeadLetters(d) => match (m.page) {
+      QueuesPage(v) => withPage(m, QueuesPage(QueuesData { ...v, dead: Some(d) })),
+      _ => m,
+    },
+    SortApps(key) => match (m.page) {
+      AppsPage(v) => withPage(m, AppsPage(AppsData { ...v, sort: nextSort(v.sort, key) })),
+      _ => m,
+    },
+    PublishForm(encoded) => Model {
+      ...m,
+      draftQueue: formField(encoded, "queue").trim(),
+      draftBody: formField(encoded, "body"),
+    },
+    FilterForm(encoded) => withLogs(
+      m,
+      LogState {
+        filter: filterFromForm(encoded),
+        following: m.logs.following,
+        lines: [],
+        lastId: 0,
+        error: "",
+      },
+    ),
+    ToggleFollow => withLogs(
+      m,
+      LogState {
+        filter: m.logs.filter,
+        following: !m.logs.following,
+        lines: m.logs.following ? m.logs.lines : [],
+        lastId: m.logs.following ? m.logs.lastId : 0,
+        error: "",
+      },
+    ),
+    ClearLines => withLogs(
+      m,
+      LogState {
+        filter: m.logs.filter,
+        following: m.logs.following,
+        lines: [],
+        lastId: m.logs.lastId,
+        error: "",
+      },
+    ),
+    LinesArrived(ls) => withLogs(m, appendLines(m.logs, ls)),
+    StreamFailed(e) => withLogs(
+      m,
+      LogState {
+        filter: m.logs.filter,
+        following: m.logs.following,
+        lines: m.logs.lines,
+        lastId: m.logs.lastId,
+        error: e,
+      },
+    ),
+    _ => m,
+  };
+}
+
+// Does this page show the live log (so that the browser should poll the stream)?
+export function hasLiveLogs(p: Page): bool {
+  return match (p) {
+    LogsPage => true,
+    AppPage(v) => match (v.tab) {
+      TabLogs => true,
+      _ => false,
+    },
+    _ => false,
+  };
+}

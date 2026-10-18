@@ -1,0 +1,7 @@
+// A queue consumer that always fails: its messages end up as dead letters.
+import { exit } from "std:process";
+
+function main(): void {
+  console.error("orders: cannot process the message");
+  exit(3);
+}

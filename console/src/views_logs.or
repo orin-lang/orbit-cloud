@@ -1,0 +1,98 @@
+// Live logs: the filter bar and the box of lines. Used by the Logs page and the Logs tab of an app.
+import {
+  Node, el, text, cls, attr, key, value, nothing, inputType, PageHeader, Stack, Card, InlineForm,
+  TextField, SelectField, choice, Button, SubmitButton, ButtonPrimary, ButtonSecondary, ButtonGhost,
+  ButtonDanger, IconLabelButton, Banner, ToneDanger, Badge, ToneSuccess, ToneNeutral, EmptyState,
+  Loading, Inline,
+} from "orin-ui";
+import { LogLine } from "./types";
+import { Model, Msg, LogState, FilterForm, ToggleFollow, ClearLines } from "./model";
+import { LogLineRow } from "./views_common";
+
+function newestFirstOf(lines: LogLine[]): LogLine[] {
+  let out: LogLine[] = [];
+  let i = lines.length;
+  while (i > 0) {
+    i -= 1;
+    out.push(lines[i]);
+  }
+  return out;
+}
+
+function FilterBar(s: LogState, lockApp: bool): Node<Msg> {
+  const f = s.filter;
+  return InlineForm<Msg>(
+    v => FilterForm(v),
+    [
+      lockApp
+          ? el<Msg>(
+            "input",
+            [inputType<Msg>("hidden"), attr<Msg>("name", "app"), value<Msg>(f.app)],
+            [],
+          )
+          : TextField<Msg>("app", "App", f.app, "", "any app"),
+      SelectField<Msg>(
+        "level",
+        "Level",
+        [
+          choice("", "Any level"),
+          choice("trace", "trace"),
+          choice("debug", "debug"),
+          choice("info", "info"),
+          choice("warn", "warn"),
+          choice("error", "error"),
+        ],
+        f.level,
+      ),
+      TextField<Msg>("contains", "Contains", f.contains, "", "text in the message"),
+      SubmitButton<Msg>("Apply", ButtonSecondary),
+      s.following
+          ? IconLabelButton<Msg>("pause", "Pause", ButtonPrimary, ToggleFollow)
+          : IconLabelButton<Msg>("play", "Follow", ButtonPrimary, ToggleFollow),
+      Button<Msg>("Clear", ButtonGhost, ClearLines),
+    ],
+  );
+}
+
+// LogsBody(model, lockApp) -- the filter bar over the live box. `lockApp`: the app filter is fixed (the Logs tab of an app).
+export function LogsBody(m: Model, lockApp: bool): Node<Msg> {
+  const s = m.logs;
+  const lines = newestFirstOf(s.lines);
+  const status = s.following ? Badge<Msg>("Live", ToneSuccess) : Badge<Msg>("Paused", ToneNeutral);
+  return Stack<Msg>([
+    Card<Msg>("", [], [FilterBar(s, lockApp)]),
+    s.error.length > 0
+        ? Banner<Msg>(ToneDanger, "Cannot read the log", s.error, [])
+        : nothing<Msg>(),
+    Card<Msg>(
+      "Log lines",
+      [
+        status,
+        el<Msg>(
+          "span",
+          [cls<Msg>("ou-muted")],
+          [text<Msg>(s.lines.length.toString() + " shown, newest at the bottom")],
+        ),
+      ],
+      [
+        lines.length > 0
+            ? el<Msg>("div", [cls<Msg>("logbox")], lines.map(l => LogLineRow(l, !lockApp)))
+            : s.following
+                ? Loading<Msg>("Waiting for log lines that match...")
+                : EmptyState<Msg>(
+                  "logs",
+                  "Nothing to show",
+                  "Press Follow to stream the log lines that match the filter.",
+                  [],
+                ),
+      ],
+    ),
+  ]);
+}
+
+export function LogsView(m: Model): Node<Msg> {
+  return Stack<Msg>([
+    PageHeader<Msg>("Logs", "Live log lines of every app, filtered.", [], []),
+    LogsBody(m, false),
+  ]);
+}

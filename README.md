@@ -21,6 +21,8 @@ target/release/occtl deploy hello hello.wasm
 target/release/occtl run hello          # prints the run and its log lines
 target/release/occtl trace <run-id>     # load / instantiate / execute spans
 open http://127.0.0.1:8080/             # web console
+console/run.sh                          # or the console written in Orin: http://127.0.0.1:8081/ (see console/README.md)
+console/tools/demo.sh                   # orbitd and that console with demo data and history
 ```
 
 A queue consumer gets each message on stdin; exit 0 acknowledges it:
@@ -55,6 +57,7 @@ partition; see [deploy/os/README.md](deploy/os/README.md) for building it and bo
 | `crates/oc-store` | SQLite persistence: apps, deployments, modules, runs, logs, spans, KV, queues |
 | `crates/orbitd` | the node: executor on `orbit-runtime`, supervisor for services and consumers, HTTP API, metrics, console |
 | `crates/occtl` | the command-line client |
+| `console/` | the web console as an Orin application on orin-web and orin-ui, a client of the `/v1` API |
 | `docs/` | plan, architecture, API |
 | `deploy/` | Docker (`docker/`), systemd (`systemd/`) and the mkosi appliance OS recipe (`os/`) |
 

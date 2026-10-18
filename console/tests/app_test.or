@@ -1,0 +1,471 @@
+// The console's routes through orin-web's TestClient, against a fake orbitd.
+import { assert, assertEq, assertEqString } from "std:test";
+import { TestClient, Response, assertStatus, assertHeader, readEvents } from "orin-web";
+import {
+  withConsole, withConsoleOn, downApi, consoleToken, between, modelAfter, pathIn, pathText,
+} from "./support";
+import { cookieValue } from "../src/app";
+import { RouteApp, RouteQueues, RouteLogs } from "../src/effects";
+import {
+  TabOverview, TabDeployments, TabKv, TabSettings, OpenDialog, ConfirmDelete, ConfirmActivate,
+  PublishDialog,
+} from "../src/model";
+
+// Signs in with the token and returns a client that sends the login cookie.
+function signedIn(client: TestClient): TestClient {
+  const res = client.post("/login", "token=" + consoleToken());
+  assertStatus(res, 303);
+  const cookie = cookieValue(res.header("Set-Cookie").unwrapOr(""), "orbit_console");
+  assert(cookie.length == 32, "a 32 digit login id");
+  return client.withHeader("Cookie", "orbit_console=" + cookie);
+}
+
+function sessionOf(html: string): string {
+  return between(html, "data-ou-session=\"", "\"");
+}
+
+function eventBody(path: int[], event: string, value: string): string {
+  return "{\"t\":\"event\",\"path\":" + pathText(path) + ",\"event\":\"" + event + "\",\"value\":\""
+      + value + "\"}";
+}
+
+@Test
+function openRoutesNeedNoSignIn(): void {
+  withConsole(client => {
+    assertEqString(client.get("/healthz").bodyText(), "ok", "health");
+    const login = client.get("/login");
+    assertStatus(login, 200);
+    assert(
+      login.bodyText().includes("Sign in") && login.bodyText().includes("orin-ui-kit.css"),
+      "the sign-in page uses the kit styles",
+    );
+    const css = client.get("/assets/console.css");
+    assertStatus(css, 200);
+    assertHeader(css, "Content-Type", "text/css; charset=utf-8");
+    assertStatus(client.get("/assets/orin-ui.js"), 200);
+    assertStatus(client.get("/assets/orin-ui-kit.css"), 200);
+    assertHeader(
+      client.get("/assets/orin-ui-kit.js"),
+      "Content-Type",
+      "text/javascript; charset=utf-8",
+    );
+    assertStatus(client.get("/favicon.ico"), 204);
+  });
+}
+
+@Test
+function pagesRedirectToTheLoginForm(): void {
+  withConsole(client => {
+    for (const path of [
+      "/",
+      "/apps",
+      "/apps/hello",
+      "/apps/hello/deployments",
+      "/runs",
+      "/runs/abc",
+      "/logs",
+      "/queues",
+      "/kv",
+      "/settings",
+    ]) {
+      const res = client.get(path);
+      assertStatus(res, 303);
+      assertHeader(res, "Location", "/login");
+    }
+  });
+}
+
+@Test
+function otherMethodsGetA401(): void {
+  withConsole(client => {
+    assertStatus(client.post("/ui/events", "{\"t\":\"join\"}"), 401);
+    assertStatus(client.post("/logout", ""), 401);
+    assertStatus(client.get("/ui/stream?s=s0"), 303);
+  });
+}
+
+@Test
+function aWrongTokenIsRefused(): void {
+  withConsole(client => {
+    const res = client.post("/login", "token=nope");
+    assertStatus(res, 401);
+    assert(res.bodyText().includes("not right"), "says so");
+    assert(res.header("Set-Cookie").isNone(), "no cookie");
+    assertHeader(client.get("/?token=nope"), "Location", "/login");
+  });
+}
+
+@Test
+function loginSetsAHardenedCookieAndLogoutRevokesIt(): void {
+  withConsole(client => {
+    const res = client.post("/login", "token=" + consoleToken());
+    assertStatus(res, 303);
+    assertHeader(res, "Location", "/");
+    const set = res.header("Set-Cookie").unwrapOr("");
+    assert(
+      set.includes("HttpOnly") && set.includes("SameSite=Strict") && set.includes("Path=/"),
+      "cookie attributes",
+    );
+    const me = signedIn(client);
+    assertStatus(me.get("/"), 200);
+    const out = me.post("/logout", "");
+    assertStatus(out, 303);
+    assert(out.header("Set-Cookie").unwrapOr("").includes("Max-Age=0"), "cookie cleared");
+    assertStatus(me.get("/"), 303);
+  });
+}
+
+@Test
+function aBearerTokenAndAQueryTokenAlsoSignIn(): void {
+  withConsole(client => {
+    assertStatus(client.withHeader("Authorization", "Bearer " + consoleToken()).get("/runs"), 200);
+    assertStatus(client.withHeader("Authorization", "Bearer wrong").post("/ui/events", "{}"), 401);
+    const q = client.get("/runs?token=" + consoleToken());
+    assertStatus(q, 303);
+    assertHeader(q, "Location", "/runs");
+    assert(q.header("Set-Cookie").unwrapOr("").startsWith("orbit_console="), "cookie issued");
+    assertStatus(client.post("/ui/events?token=" + consoleToken(), "{}"), 401);
+  });
+}
+
+@Test
+function everyScreenIsAFullPageWithTheKitAndAMountElement(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    for (const path of [
+      "/",
+      "/apps",
+      "/apps/hello",
+      "/apps/hello/deployments",
+      "/apps/hello/runs",
+      "/apps/hello/logs",
+      "/apps/hello/kv?ns=cfg",
+      "/apps/hello/settings",
+      "/runs",
+      "/runs/abc",
+      "/logs",
+      "/queues",
+      "/kv",
+      "/settings",
+    ]) {
+      const res = me.get(path);
+      assertStatus(res, 200);
+      assertHeader(res, "Content-Type", "text/html; charset=utf-8");
+      assertHeader(res, "Cache-Control", "no-store");
+      const h = res.bodyText();
+      assert(
+        h.includes("<link rel=\"stylesheet\" href=\"/assets/orin-ui-kit.css\">"),
+        "kit styles on " + path,
+      );
+      assert(
+        h.includes("<script src=\"/assets/orin-ui-kit.js\"></script>"),
+        "theme script in the head on " + path,
+      );
+      assert(
+        h.includes("<div id=\"orin-ui\" data-orin-ui=\"/ui/events\""),
+        "mount element on " + path,
+      );
+      assert(
+        h.includes("data-ou-seq=\"0\"") && sessionOf(h).length > 0,
+        "session and sequence on " + path,
+      );
+      assert(h.includes("<aside class=\"ou-sidebar\">"), "sidebar on " + path);
+      assert(h.includes("/assets/orin-ui.js"), "client on " + path);
+    }
+  });
+}
+
+@Test
+function pageTitlesNameThePage(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    assert(me.get("/").bodyText().includes("<title>Overview - Orbit Cloud</title>"), "overview");
+    assert(me.get("/apps/hello").bodyText().includes("<title>hello - Orbit Cloud</title>"), "app");
+    assert(me.get("/runs/abc").bodyText().includes("<title>Run abc - Orbit Cloud</title>"), "run");
+  });
+}
+
+@Test
+function onlyTheLogScreensOpenTheStream(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    assert(me.get("/logs").bodyText().includes("data-ou-stream=\"/ui/stream\""), "logs page");
+    assert(
+      me.get("/apps/hello/logs").bodyText().includes("data-ou-stream=\"/ui/stream\""),
+      "an app's logs tab",
+    );
+    assert(!me.get("/").bodyText().includes("data-ou-stream"), "overview");
+    assert(!me.get("/apps/hello").bodyText().includes("data-ou-stream"), "an app's overview");
+  });
+}
+
+@Test
+function theOverviewAndTheAppsPageCarryTheirData(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const o = me.get("/").bodyText();
+    assert(
+      o.includes("Runs, last 24 h")
+          && o.includes("Latest failed runs")
+          && o.includes("class=\"ou-bar ou-fill-0\""),
+      "overview",
+    );
+    const a = me.get("/apps").bodyText();
+    assert(
+      a.includes("href=\"/apps/hello\"")
+          && a.includes("href=\"/apps/worker\"")
+          && a.includes("class=\"ou-spark\""),
+      "apps: " + a,
+    );
+  });
+}
+
+@Test
+function appTabsAreRoutesAndUnknownTabsAre404(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    assert(me.get("/apps/hello/deployments").bodyText().includes("Versions"), "deployments");
+    assert(me.get("/apps/hello/runs").bodyText().includes("href=\"/runs/abc\""), "runs");
+    assert(
+      me.get("/apps/hello/kv?ns=cfg").bodyText().includes("ou-listbtn active"),
+      "the ns query opens a namespace",
+    );
+    assert(me.get("/apps/hello/settings").bodyText().includes("Danger zone"), "settings");
+    assertStatus(me.get("/apps/hello/bogus"), 404);
+    assertStatus(me.get("/apps/svc"), 200);
+  });
+}
+
+@Test
+function missingThingsAre404AndApiFailuresAre502(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const gone = me.get("/apps/nope");
+    assertStatus(gone, 404);
+    assert(
+      gone.bodyText().includes("Not found") && gone.bodyText().includes("<aside"),
+      "the 404 page keeps the shell",
+    );
+    assertStatus(me.get("/runs/nope"), 404);
+    assertStatus(me.get("/apps/broken"), 502);
+    assertStatus(me.get("/no/such/page"), 404);
+  });
+  withConsoleOn(
+    downApi(),
+    client => {
+      const res = signedIn(client).get("/");
+      assertStatus(res, 502);
+      assert(
+        res.bodyText().includes("Cannot reach orbitd")
+            && res.bodyText().includes("connection refused"),
+        "network failure shown",
+      );
+    },
+  );
+}
+
+@Test
+function hostileNamesAreEscaped(): void {
+  withConsole(client => {
+    const html = signedIn(client).get("/apps/evil").bodyText();
+    assert(!html.includes("<img src=x"), "no raw element from a name");
+    assert(!html.includes("<script>alert"), "no raw script element");
+    assert(html.includes("&lt;img src=x onerror=alert(1)&gt;"), "the name is shown as text");
+  });
+}
+
+// ------------------------------------------------------------------ events
+
+@Test
+function runNowPatchesThePageAndShowsAToast(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const sid = sessionOf(me.get("/apps/hello").bodyText());
+    const path = pathIn(modelAfter(RouteApp("hello", TabOverview, ""), []), "button", "Run now");
+    const run = me
+        .withHeader("X-Orin-UI-Session", sid)
+        .post("/ui/events", eventBody(path, "click", ""));
+    assertStatus(run, 200);
+    assertHeader(run, "Content-Type", "application/json");
+    const body = run.bodyText();
+    assert(body.startsWith("{\"t\":\"patch\",\"n\":0,"), "a numbered patch: " + body);
+    assert(body.includes("Run fresh succeeded, exit 0") && body.includes("ou-toast"), "the toast");
+    assert(body.includes("/runs/fresh"), "link to the run");
+    const again = me
+        .withHeader("X-Orin-UI-Session", sid)
+        .post("/ui/events", eventBody(path, "click", ""));
+    assert(again.bodyText().startsWith("{\"t\":\"patch\",\"n\":1,"), "n counts up");
+  });
+}
+
+@Test
+function activatingAVersionGoesThroughAConfirmDialog(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const sid = sessionOf(me.get("/apps/hello/deployments").bodyText());
+    const ui = me.withHeader("X-Orin-UI-Session", sid);
+    const initial = modelAfter(RouteApp("hello", TabDeployments, ""), []);
+    const open = ui.post(
+      "/ui/events",
+      eventBody(pathIn(initial, "button", "Activate"), "click", ""),
+    );
+    assert(
+      open.bodyText().includes("Make this version active?") && open.bodyText().includes("role"),
+      "the dialog opens: " + open.bodyText(),
+    );
+    const withDialog = modelAfter(
+      RouteApp("hello", TabDeployments, ""),
+      [OpenDialog(ConfirmActivate(1))],
+    );
+    const done = ui.post(
+      "/ui/events",
+      eventBody(pathIn(withDialog, "button", "Activate version"), "click", ""),
+    );
+    assert(done.bodyText().includes("Deployment 1 is active"), "activated: " + done.bodyText());
+  });
+}
+
+@Test
+function deletingAnAppNeedsItsNameTyped(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const sid = sessionOf(me.get("/apps/hello/settings").bodyText());
+    const ui = me.withHeader("X-Orin-UI-Session", sid);
+    const initial = modelAfter(RouteApp("hello", TabSettings, ""), []);
+    ui.post("/ui/events", eventBody(pathIn(initial, "button", "Delete app"), "click", ""));
+    const open = modelAfter(RouteApp("hello", TabSettings, ""), [OpenDialog(ConfirmDelete)]);
+    const form = pathIn(open, "form", "Delete app");
+    const wrong = ui.post("/ui/events", eventBody(form, "submit", "confirm=nope"));
+    assert(wrong.bodyText().includes("Type the app"), "refused: " + wrong.bodyText());
+    const right = ui.post("/ui/events", eventBody(form, "submit", "confirm=hello"));
+    assert(right.bodyText().includes("Deleted hello"), "deleted: " + right.bodyText());
+  });
+}
+
+@Test
+function aKvNamespaceOpensInPlace(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const sid = sessionOf(me.get("/apps/hello/kv").bodyText());
+    const path = pathIn(modelAfter(RouteApp("hello", TabKv, ""), []), "button", "cfg");
+    const kv = me
+        .withHeader("X-Orin-UI-Session", sid)
+        .post("/ui/events", eventBody(path, "click", ""));
+    const body = kv.bodyText();
+    assert(body.includes("color") && body.includes("4 B"), "the entries: " + body);
+    assert(!body.includes("<script>"), "values are never markup");
+  });
+}
+
+@Test
+function publishingToAQueueGoesThroughADialogForm(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const sid = sessionOf(me.get("/queues").bodyText());
+    const ui = me.withHeader("X-Orin-UI-Session", sid);
+    const initial = modelAfter(RouteQueues, []);
+    ui.post("/ui/events", eventBody(pathIn(initial, "button", "Publish message"), "click", ""));
+    const open = modelAfter(RouteQueues, [OpenDialog(PublishDialog)]);
+    const form = pathIn(open, "form", "Publish");
+    const empty = ui.post("/ui/events", eventBody(form, "submit", "queue=&body=x"));
+    assert(empty.bodyText().includes("Give the queue a name"), "validation: " + empty.bodyText());
+    const sent = ui.post(
+      "/ui/events",
+      eventBody(form, "submit", "queue=orders&body=%7B%22id%22%3A1%7D"),
+    );
+    assert(sent.bodyText().includes("Queued message 42 on orders"), "flash: " + sent.bodyText());
+  });
+}
+
+@Test
+function eventsFromAnUnknownSessionAskForAReload(): void {
+  withConsole(client => {
+    const me = signedIn(client).withHeader("X-Orin-UI-Session", "s999");
+    const res = me.post("/ui/events", eventBody([0], "click", ""));
+    assertStatus(res, 200);
+    assert(
+      res.bodyText().startsWith("{\"t\":\"mount\"") && res.bodyText().includes("out of date"),
+      "a mount with a notice",
+    );
+    assert(
+      me.post("/ui/events", "{\"t\":\"join\"}").bodyText().includes("out of date"),
+      "join too",
+    );
+  });
+}
+
+@Test
+function malformedEventsAreBadRequests(): void {
+  withConsole(client => {
+    const me = signedIn(client).withHeader("X-Orin-UI-Session", "s0");
+    assertStatus(me.post("/ui/events", "not json"), 400);
+    assertStatus(me.post("/ui/events", "{\"t\":\"nonsense\"}"), 400);
+  });
+}
+
+@Test
+function anEventAtAPathWithoutAHandlerChangesNothing(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const sid = sessionOf(me.get("/apps/hello").bodyText());
+    const res = me
+        .withHeader("X-Orin-UI-Session", sid)
+        .post("/ui/events", eventBody([0, 0], "click", ""));
+    assertEqString(res.bodyText(), "{\"t\":\"patch\",\"ops\":[]}", "empty patch");
+  });
+}
+
+@Test
+function joinSendsTheWholeScreenNumbered(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const sid = sessionOf(me.get("/queues").bodyText());
+    const body = me
+        .withHeader("X-Orin-UI-Session", sid)
+        .post("/ui/events", "{\"t\":\"join\"}")
+        .bodyText();
+    assert(body.startsWith("{\"t\":\"mount\",\"n\":0,\"dom\":["), "mount: " + body);
+    assert(body.includes("Queues"), "has the screen");
+  });
+}
+
+@Test
+function theStreamPushesNewLogLinesAsPatches(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    const sid = sessionOf(me.get("/logs").bodyText());
+    const ui = me.withHeader("X-Orin-UI-Session", sid);
+    const idle = readEvents(ui.get("/ui/stream?s=" + sid), 4);
+    assertEq(idle.length.toInt(), 1, "one event");
+    assertEqString(idle[0].data, "", "no data");
+    assertEq(idle[0].retry.unwrapOr(0), 1500, "slow poll while not following");
+    const follow = pathIn(modelAfter(RouteLogs, []), "button", "Follow");
+    const reply = ui.post("/ui/events", eventBody(follow, "click", ""));
+    assert(reply.bodyText().includes("line 3"), "history: " + reply.bodyText());
+    const quiet = readEvents(ui.get("/ui/stream?s=" + sid), 4);
+    assertEq(quiet.length.toInt(), 1, "no new lines, no patch");
+    assertEq(quiet[0].retry.unwrapOr(0), 500, "fast poll while following");
+  });
+}
+
+@Test
+function theStreamOfAnUnknownSessionIsA404(): void {
+  withConsole(client => {
+    const me = signedIn(client);
+    assertStatus(me.get("/ui/stream?s=s77"), 404);
+    assertStatus(me.get("/ui/stream"), 404);
+  });
+}
+
+@Test
+function cookiesAreParsedByName(): void {
+  assertEqString(cookieValue("a=1; orbit_console=xyz; b=2", "orbit_console"), "xyz", "middle");
+  assertEqString(cookieValue("orbit_console=xyz", "orbit_console"), "xyz", "only");
+  assertEqString(cookieValue("a=1", "orbit_console"), "", "absent");
+  assertEqString(cookieValue("", "orbit_console"), "", "empty");
+  assertEqString(
+    cookieValue("xorbit_console=1", "orbit_console"),
+    "",
+    "a longer name does not match",
+  );
+}

@@ -1,0 +1,228 @@
+// The runs list and one run: status, resources, the span waterfall and the log lines.
+import {
+  Node, el, text, cls, href, attr, key, style, nothing, PageHeader, Grid, Card, FlushCard, Stack,
+  StatCard, KeyValue, pair, textPair, Crumb, StatusPill, Badge, ToneNeutral, ToneDanger, Banner,
+  LinkButton, ButtonSecondary, IconLabelButton, ButtonPrimary, EmptyState, Mono, Inline, tenths,
+  JsonText,
+} from "orin-ui";
+import { Span, LogLine, Run } from "./types";
+import { Model, Msg, RunsData, RunView, Refresh } from "./model";
+import { dateTime, duration, bytes, optInt, runUs, clip } from "./fmt";
+import { appHref, runHref, RunsTable, RunDuration, LogLineRow } from "./views_common";
+
+export function RunsView(m: Model, d: RunsData): Node<Msg> {
+  return Stack<Msg>([
+    PageHeader<Msg>(
+      "Runs",
+      "The latest 100 runs of every app.",
+      [],
+      [IconLabelButton<Msg>("refresh", "Refresh", ButtonSecondary, Refresh)],
+    ),
+    FlushCard<Msg>(
+      "",
+      [],
+      [RunsTable(d.runs, true, d.now, "Deploy an app and run it: occtl run NAME.")],
+    ),
+  ]);
+}
+
+// "12.3%" from a part per thousand.
+function percent(permille: int): string {
+  return (permille / 10).toString() + "." + (permille % 10).toString() + "%";
+}
+
+function SpanRow(s: Span, t0: int, total: int): Node<Msg> {
+  const left = (s.startUs - t0) * 1000 / total;
+  const width = (s.endUs - s.startUs) * 1000 / total;
+  return el<Msg>(
+    "div",
+    [key<Msg>(s.name + s.startUs.toString()), cls<Msg>("wf-row")],
+    [
+      el<Msg>(
+        "div",
+        [cls<Msg>(s.parentId.length > 0 ? "wf-name child" : "wf-name")],
+        [text<Msg>(s.name)],
+      ),
+      el<Msg>(
+        "div",
+        [
+          cls<Msg>("wf-track"),
+          attr<Msg>(
+            "title",
+            s.name + ": " + duration(s.endUs - s.startUs) + " " + clip(s.attrs, 120),
+          ),
+        ],
+        [
+          el<Msg>(
+            "span",
+            [
+              cls<Msg>(s.parentId.length > 0 ? "wf-bar" : "wf-bar root"),
+              style<Msg>("left:" + percent(left) + ";width:" + percent(width < 4 ? 4 : width)),
+            ],
+            [],
+          ),
+        ],
+      ),
+      el<Msg>("div", [cls<Msg>("wf-dur")], [text<Msg>(duration(s.endUs - s.startUs))]),
+    ],
+  );
+}
+
+function AxisLabel(i: int, total: int): Node<Msg> {
+  return el<Msg>(
+    "span",
+    [
+      key<Msg>("t" + i.toString()),
+      cls<Msg>("wf-tick"),
+      style<Msg>("left:" + (i * 25).toString() + "%"),
+    ],
+    [text<Msg>(duration(total * i / 4))],
+  );
+}
+
+// The spans of a run on a time axis: the axis runs from the start of the first span to the end of the last, with five labelled ticks.
+export function Waterfall(spans: Span[]): Node<Msg> {
+  if (spans.length == 0) {
+    return EmptyState<Msg>("runs", "No spans recorded", "", []);
+  }
+  let t0 = spans[0].startUs;
+  let t1 = spans[0].endUs;
+  for (const s of spans) {
+    if (s.startUs < t0) {
+      t0 = s.startUs;
+    }
+    if (s.endUs > t1) {
+      t1 = s.endUs;
+    }
+  }
+  const total = t1 - t0 > 0 ? t1 - t0 : 1;
+  return el<Msg>(
+    "div",
+    [cls<Msg>("waterfall")],
+    [
+      el<Msg>(
+        "div",
+        [cls<Msg>("wf-row wf-axis")],
+        [
+          el<Msg>("div", [], []),
+          el<Msg>(
+            "div",
+            [cls<Msg>("wf-ticks")],
+            [
+              AxisLabel(0, total),
+              AxisLabel(1, total),
+              AxisLabel(2, total),
+              AxisLabel(3, total),
+              AxisLabel(4, total),
+            ],
+          ),
+          el<Msg>("div", [], []),
+        ],
+      ),
+    ].concat(
+      spans.map(s => SpanRow(s, t0, total)),
+    ),
+  );
+}
+
+// "run span 862 µs": the whole run including loading and instantiating, from the trace.
+function totalHint(spans: Span[]): string {
+  for (const s of spans) {
+    if (s.parentId.length == 0 && s.name == "run") {
+      return "whole run " + duration(s.endUs - s.startUs);
+    }
+  }
+  return "";
+}
+
+export function RunDetailView(m: Model, v: RunView): Node<Msg> {
+  const r = v.run;
+  const us = runUs(r.wallUs, r.wallMs);
+  return Stack<Msg>([
+    PageHeader<Msg>(
+      "Run " + r.id,
+      "",
+      [Crumb { label: "Runs", href: "/runs" }, Crumb { label: r.id, href: "" }],
+      [StatusPill<Msg>(r.status), LinkButton<Msg>("App " + r.app, ButtonSecondary, appHref(r.app))],
+    ),
+    r.error.length > 0 ? Banner<Msg>(ToneDanger, "The run failed", r.error, []) : nothing<Msg>(),
+    Grid<Msg>(
+      4,
+      [
+        StatCard<Msg>(
+          "Execution time",
+          us.isSome() ? duration(us.unwrap()) : "-",
+          "",
+          ToneNeutral,
+          [],
+          totalHint(v.spans),
+        ),
+        StatCard<Msg>(
+          "Peak memory",
+          r.peakMemory.isSome() ? bytes(r.peakMemory.unwrap()) : "-",
+          "",
+          ToneNeutral,
+          [],
+          "",
+        ),
+        StatCard<Msg>(
+          "Fuel",
+          r.fuel.isSome() ? r.fuel.unwrap().toString() : "-",
+          "",
+          ToneNeutral,
+          [],
+          r.fuel.isSome() ? "" : "metering is off",
+        ),
+        StatCard<Msg>(
+          "Exit code",
+          optInt(r.exitCode),
+          "",
+          r.exitCode.isSome() && r.exitCode.unwrap() != 0 ? ToneDanger : ToneNeutral,
+          [],
+          "",
+        ),
+      ],
+    ),
+    Grid<Msg>(
+      2,
+      [
+        Card<Msg>(
+          "Details",
+          [],
+          [
+            KeyValue<Msg>([
+              pair<Msg>("App", el<Msg>("a", [href<Msg>(appHref(r.app))], [text<Msg>(r.app)])),
+              textPair<Msg>("Trigger", r.trigger),
+              textPair<Msg>("Deployment", r.deployment.toString()),
+              textPair<Msg>("Started", dateTime(r.startedAt)),
+              pair<Msg>("Trace", Mono<Msg>(r.traceId)),
+            ]),
+          ],
+        ),
+        Card<Msg>(
+          "Host calls",
+          [],
+          [
+            r.hostCalls.length > 0
+                ? JsonText<Msg>(r.hostCalls)
+                : el<Msg>("span", [cls<Msg>("ou-muted")], [text<Msg>("none recorded")]),
+          ],
+        ),
+      ],
+    ),
+    Card<Msg>(
+      "Trace",
+      [Badge<Msg>(v.spans.length.toString() + " spans", ToneNeutral)],
+      [Waterfall(v.spans)],
+    ),
+    Card<Msg>(
+      "Logs",
+      [Badge<Msg>(v.logs.length.toString() + " lines", ToneNeutral)],
+      [
+        v.logs.length == 0
+            ? EmptyState<Msg>("logs", "This run wrote no log lines", "", [])
+            : el<Msg>("div", [cls<Msg>("logbox static")], v.logs.map(l => LogLineRow(l, false))),
+      ],
+    ),
+  ]);
+}

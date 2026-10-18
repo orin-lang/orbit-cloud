@@ -1,0 +1,31 @@
+// The screens of the console, as orin-ui views: `view(model)` is a pure function of the model.
+import { Node } from "orin-ui";
+import {
+  Model, Msg, Page, OverviewPage, AppsPage, AppPage, RunsPage, RunPage, LogsPage, QueuesPage,
+  KvPage, SettingsPage, NoticePage,
+} from "./model";
+import { Shell } from "./views_common";
+import { OverviewView } from "./views_overview";
+import { AppsView, AppView } from "./views_apps";
+import { RunsView, RunDetailView } from "./views_runs";
+import { LogsView } from "./views_logs";
+import { QueuesView, KvOverview, SettingsView, NoticeView } from "./views_queues";
+
+export function pageView(m: Model): Node<Msg> {
+  return match (m.page) {
+    OverviewPage(d) => OverviewView(m, d),
+    AppsPage(d) => AppsView(m, d),
+    AppPage(d) => AppView(m, d),
+    RunsPage(d) => RunsView(m, d),
+    RunPage(d) => RunDetailView(m, d),
+    LogsPage => LogsView(m),
+    QueuesPage(d) => QueuesView(m, d),
+    KvPage(rows) => KvOverview(m, rows),
+    SettingsPage(d) => SettingsView(m, d),
+    NoticePage(title, message, bad) => NoticeView(title, message, bad),
+  };
+}
+
+export function view(m: Model): Node<Msg> {
+  return Shell(m, pageView(m));
+}

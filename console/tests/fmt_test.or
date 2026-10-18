@@ -1,0 +1,50 @@
+import { assert, assertEq, assertEqString } from "std:test";
+import {
+  duration, ago, bytes, hourMinute, ratePercent, runUs, clip, timeOfDay, dateTime, microsAsMs,
+} from "../src/fmt";
+
+@Test
+function durationsKeepASensiblePrecision(): void {
+  assertEqString(duration(0), "0 µs", "zero");
+  assertEqString(duration(850), "850 µs", "microseconds");
+  assertEqString(duration(1234), "1.23 ms", "milliseconds with two decimals below 10");
+  assertEqString(duration(12345), "12.3 ms", "one decimal below 100");
+  assertEqString(duration(123456), "123 ms", "whole milliseconds");
+  assertEqString(duration(1234567), "1.23 s", "seconds");
+  assertEqString(duration(125000000), "2m 05s", "minutes");
+  assertEqString(duration(-1), "-", "negative");
+  assertEqString(duration(1000), "1.00 ms", "exactly one millisecond");
+  assertEqString(duration(10000), "10.0 ms", "boundary");
+}
+
+@Test
+function runTimesPreferMicroseconds(): void {
+  assertEq(runUs(Some(850), Some(0)).unwrap(), 850, "wall_us wins");
+  assertEq(runUs(None, Some(3)).unwrap(), 3000, "old runs have milliseconds only");
+  assert(runUs(None, None).isNone(), "running runs have neither");
+}
+
+@Test
+function relativeTimes(): void {
+  const now = 1792400000000;
+  assertEqString(ago(now, now - 10000), "just now", "seconds");
+  assertEqString(ago(now, now - 5 * 60000), "5 min ago", "minutes");
+  assertEqString(ago(now, now - 3 * 3600000), "3 h ago", "hours");
+  assertEqString(ago(now, now - 2 * 86400000), "2 d ago", "days");
+  assertEqString(ago(0, 1792336579470), "2026-10-18 15:16:19", "without a clock the date is shown");
+  assertEqString(ago(now, 0), "", "no time at all");
+}
+
+@Test
+function smallFormatters(): void {
+  assertEqString(bytes(512), "512 B", "bytes");
+  assertEqString(bytes(1835008), "1.7 MiB", "mebibytes");
+  assertEqString(bytes(2048), "2.0 KiB", "kibibytes");
+  assertEqString(hourMinute(1792336579470), "15:16", "hour and minute");
+  assertEqString(ratePercent(1, 8), "12.5%", "rate");
+  assertEqString(ratePercent(0, 0), "0%", "no runs");
+  assertEqString(clip("abcdef", 3), "abc...", "clip");
+  assertEqString(clip("abc", 3), "abc", "short text is kept");
+  assertEqString(timeOfDay(1792336579470), "15:16:19.470", "time of day");
+  assertEqString(microsAsMs(1234), "1.23 ms", "micros as ms");
+}

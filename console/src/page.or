@@ -1,0 +1,43 @@
+// The HTML around an orin-ui screen: the document, the stylesheets and the mount element the browser client attaches to.
+import { escape } from "std:html";
+
+// The first line sets the theme before the page is painted (no flash): the kit script reads the saved choice.
+function head(title: string): string {
+  return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+      + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+      + "<meta name=\"color-scheme\" content=\"light dark\">" + "<title>" + escape(title)
+      + "</title>" + "<link rel=\"icon\" href=\"data:,\">"
+      + "<script src=\"/assets/orin-ui-kit.js\"></script>"
+      + "<link rel=\"stylesheet\" href=\"/assets/orin-ui-kit.css\">"
+      + "<link rel=\"stylesheet\" href=\"/assets/console.css\"></head>";
+}
+
+// A screen: `markup` is the HTML of the orin-ui view, `session` the id of its server-side session. `stream` makes the browser
+// open the push stream (the live log); `seq` is the number of the first numbered message the server will send.
+export function screenPage(
+  title: string,
+  markup: string,
+  session: string,
+  seq: int,
+  stream: bool,
+): string {
+  return head(title) + "<body><div id=\"orin-ui\" data-orin-ui=\"/ui/events\" data-ou-session=\""
+      + escape(session) + "\" data-ou-seq=\"" + seq.toString() + "\""
+      + (stream ? " data-ou-stream=\"/ui/stream\"" : "") + ">" + markup
+      + "</div><script src=\"/assets/orin-ui.js\"></script></body></html>";
+}
+
+// The sign-in page. `message` is "" or what went wrong.
+export function loginPage(message: string): string {
+  return head("Sign in - Orbit Cloud")
+      + "<body><main class=\"login-wrap\"><form class=\"ou-card login\" method=\"post\" action=\"/login\">"
+      + "<div class=\"login-brand\"><svg class=\"ou-logo\" viewBox=\"0 0 24 24\" fill=\"none\" aria-hidden=\"true\"><circle cx=\"12\" cy=\"12\" r=\"4.5\" fill=\"currentColor\"/>"
+      + "<ellipse cx=\"12\" cy=\"12\" rx=\"10.5\" ry=\"4.2\" transform=\"rotate(-25 12 12)\" stroke=\"currentColor\" stroke-width=\"1.6\"/></svg><span>Orbit Cloud</span></div>"
+      + "<h1>Sign in</h1>"
+      + (message.length > 0
+          ? "<p class=\"login-error\" role=\"alert\">" + escape(message) + "</p>"
+          : "")
+      + "<label class=\"ou-field\" for=\"token\"><span class=\"ou-label\">Console token</span>"
+      + "<input class=\"ou-input\" id=\"token\" name=\"token\" type=\"password\" autocomplete=\"current-password\" autofocus></label>"
+      + "<button class=\"ou-btn ou-btn-primary\" type=\"submit\">Sign in</button></form></main></body></html>";
+}

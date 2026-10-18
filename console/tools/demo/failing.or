@@ -1,0 +1,8 @@
+// A job that always fails with exit status 1.
+import { exit } from "std:process";
+
+function main(): void {
+  console.log("sync: contacting upstream");
+  console.error("sync: upstream answered 503");
+  exit(1);
+}

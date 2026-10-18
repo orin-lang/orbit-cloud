@@ -1,0 +1,433 @@
+// What the console does against orbitd. `loadModel` builds the data of a screen for the first render; `perform` turns a user's
+// message into API calls and returns the messages that tell `update` what happened.
+import { SortState, unsorted } from "orin-ui";
+import { Api } from "./api";
+import {
+  listApps, getApp, appRuns, recentRuns, getRun, runTrace, runLogs, kvNamespaces, kvEntries,
+  activate, runNow, deleteApp, listQueues, deadLetters, redrive, publish, logsAfter, stats,
+  nodeInfo,
+} from "./api";
+import { AppSummary, Run, Stats, NodeInfo, KvView, DeadView, Queue } from "./types";
+import {
+  Model, Msg, Page, AppTab, TabOverview, TabDeployments, TabRuns, TabLogs, TabKv, TabSettings,
+  OverviewData, AppRow, AppsData, AppData, RunView, RunsData, QueuesData, KvRow, SettingsData,
+  LogFilter, OverviewPage, AppsPage, AppPage, RunsPage, RunPage, LogsPage, QueuesPage, KvPage,
+  SettingsPage, NoticePage, Noop, Refresh, RunNow, OpenDialog, CloseDialog, ActivateConfirmed,
+  DeleteForm, PublishForm, ShowKv, SelectKey, HideKv, Redrive, ShowDead, HideDead, FilterForm,
+  ToggleFollow, Show, Notice, ShowKvEntries, ShowDeadLetters, LinesArrived, StreamFailed,
+  ClearDraft, NoDialog, formField, goodFlash, badFlash, noFlash, initialModel, update, Flash,
+  LogState, LogFilter, emptyLogs,
+} from "./model";
+
+// Which screen a URL names.
+export type Route =
+  RouteOverview
+  | RouteApps
+  | RouteApp(string, AppTab, string)
+  | RouteRuns
+  | RouteRun(string)
+  | RouteLogs
+  | RouteQueues
+  | RouteKv
+  | RouteSettings;
+
+export function hour(): int {
+  return 3600000;
+}
+
+function runLimit(): int {
+  return 100;
+}
+
+// The text of an app tab in a URL: /apps/NAME/TAB.
+export function tabName(t: AppTab): string {
+  return match (t) {
+    TabOverview => "overview",
+    TabDeployments => "deployments",
+    TabRuns => "runs",
+    TabLogs => "logs",
+    TabKv => "kv",
+    TabSettings => "settings",
+  };
+}
+
+export function tabOf(name: string): Option<AppTab> {
+  return match (name) {
+    "" => Some(TabOverview),
+    "overview" => Some(TabOverview),
+    "deployments" => Some(TabDeployments),
+    "runs" => Some(TabRuns),
+    "logs" => Some(TabLogs),
+    "kv" => Some(TabKv),
+    "settings" => Some(TabSettings),
+    _ => None,
+  };
+}
+
+// The run time of buckets as a series for a chart: runs started per bucket.
+export function runsPerBucket(s: Stats): int[] {
+  return s.buckets.map(b => b.succeeded + b.failed + b.running);
+}
+
+function lastRunOf(app: string, runs: Run[]): Option<Run> {
+  for (const r of runs) {
+    if (r.app == app) {
+      return Some(r);
+    }
+  }
+  return None;
+}
+
+export function loadOverview(api: Api): Result<OverviewData, string> {
+  const apps = listApps(api)?;
+  const cur = stats(api, "", 0, 0, hour())?;
+  const prev = stats(api, "", cur.since - 24 * hour(), cur.since, hour())?;
+  const queues = listQueues(api)?;
+  const runs = recentRuns(api, runLimit())?;
+  const node = nodeInfo(api);
+  let failed: Run[] = [];
+  for (const r of runs) {
+    if (r.status == "failed" && failed.length < 5) {
+      failed.push(r);
+    }
+  }
+  return Ok(OverviewData {
+    apps: apps,
+    stats: cur,
+    previous: prev,
+    queues: queues,
+    failed: failed,
+    latest: runs.slice(0, runs.length < 6 ? runs.length : 6),
+    workers: node.isOk() ? node.unwrap().workers.length.toInt() : 0,
+  });
+}
+
+export function loadApps(api: Api): Result<AppsData, string> {
+  const apps = listApps(api)?;
+  const runs = recentRuns(api, 200)?;
+  let rows: AppRow[] = [];
+  let now: int = 0;
+  for (const a of apps) {
+    const st = stats(api, a.name, 0, 0, 2 * hour())?;
+    now = st.until;
+    rows.push(AppRow {
+      app: a,
+      last: lastRunOf(a.name, runs),
+      trend: runsPerBucket(st),
+      runs24: st.totals.succeeded + st.totals.failed + st.totals.running,
+    });
+  }
+  return Ok(AppsData { rows: rows, sort: unsorted(), now: now });
+}
+
+export function loadApp(api: Api, name: string, tab: AppTab, ns: string): Result<AppData, string> {
+  const detail = getApp(api, name)?;
+  const runs = appRuns(api, name, 100)?;
+  const st = stats(api, name, 0, 0, hour())?;
+  const namespaces = kvNamespaces(api, name)?;
+  let kv: Option<KvView> = None;
+  if (ns.length > 0) {
+    kv = Some(KvView { namespace: ns, entries: kvEntries(api, name, ns, 200)? });
+  }
+  return Ok(AppData {
+    detail: detail,
+    tab: tab,
+    runs: runs,
+    stats: st,
+    namespaces: namespaces,
+    kv: kv,
+    selectedKey: "",
+    diff: None,
+    showRaw: false,
+    now: st.until,
+  });
+}
+
+export function loadRun(api: Api, id: string): Result<RunView, string> {
+  const run = getRun(api, id)?;
+  const spans = runTrace(api, id)?;
+  const logs = runLogs(api, id, 2000)?;
+  return Ok(RunView { run: run, spans: spans, logs: logs });
+}
+
+// The queues page; `deadOf` names the queue whose dead letters stay open ("" for none).
+export function loadQueues(api: Api, deadOf: string): Result<QueuesData, string> {
+  const qs = listQueues(api)?;
+  let dead: Option<DeadView> = None;
+  if (deadOf.length > 0) {
+    dead = Some(DeadView { queue: deadOf, letters: deadLetters(api, deadOf, 100)? });
+  }
+  return Ok(QueuesData { queues: qs, dead: dead });
+}
+
+export function loadKvRows(api: Api): Result<KvRow[], string> {
+  const apps = listApps(api)?;
+  let rows: KvRow[] = [];
+  for (const a of apps) {
+    for (const n of kvNamespaces(api, a.name)?) {
+      rows.push(KvRow { app: a.name, namespace: n.namespace, entries: n.entries });
+    }
+  }
+  return Ok(rows);
+}
+
+export function loadPage(api: Api, route: Route): Result<Page, string> {
+  return match (route) {
+    RouteOverview => Ok(OverviewPage(loadOverview(api)?)),
+    RouteApps => Ok(AppsPage(loadApps(api)?)),
+    RouteApp(name, tab, ns) => Ok(AppPage(loadApp(api, name, tab, ns)?)),
+    RouteRuns => {
+      const runs = recentRuns(api, runLimit())?;
+      return Ok(RunsPage(RunsData { runs: runs, now: 0 }));
+    },
+    RouteRun(id) => Ok(RunPage(loadRun(api, id)?)),
+    RouteLogs => Ok(LogsPage),
+    RouteQueues => Ok(QueuesPage(loadQueues(api, "")?)),
+    RouteKv => Ok(KvPage(loadKvRows(api)?)),
+    RouteSettings => {
+      const n = nodeInfo(api);
+      return Ok(SettingsPage(SettingsData { node: n.isOk() ? Some(n.unwrap()) : None }));
+    },
+  };
+}
+
+// The model of a first render: the page and what the shell shows about the node. An app's Logs tab starts with the app as filter.
+export function loadModel(api: Api, route: Route, nodeLabel: string): Result<Model, string> {
+  const page = loadPage(api, route)?;
+  const node = nodeInfo(api);
+  let m = initialModel(page, node.isOk() ? Some(node.unwrap()) : None, nodeLabel);
+  match (route) {
+    RouteApp(name, tab, ns) => {
+      if (match (tab) {
+        TabLogs => true,
+        _ => false,
+      }) {
+        m = Model {
+          ...m,
+          logs: LogState {
+            ...emptyLogs(),
+            filter: LogFilter { app: name, level: "", contains: "" },
+          },
+        };
+      }
+    },
+    _ => {},
+  }
+  return Ok(m);
+}
+
+// True when an error text from the API layer is a 404 of orbitd (an app or run that does not exist).
+export function isNotFound(message: string): bool {
+  return message.endsWith("(404)");
+}
+
+function fail(e: string): Msg[] {
+  return [Notice(badFlash(e))];
+}
+
+// Re-reads the page the model shows.
+function reload(api: Api, m: Model): Result<Page, string> {
+  return match (m.page) {
+    OverviewPage(v) => loadPage(api, RouteOverview),
+    AppsPage(v) => loadPage(api, RouteApps),
+    AppPage(v) => loadPage(
+      api,
+      RouteApp(v.detail.name, v.tab, v.kv.isSome() ? v.kv.unwrap().namespace : ""),
+    ),
+    RunsPage(v) => loadPage(api, RouteRuns),
+    RunPage(v) => loadPage(api, RouteRun(v.run.id)),
+    LogsPage => Ok(LogsPage),
+    QueuesPage(v) => Ok(QueuesPage(loadQueues(api, v.dead.isSome() ? v.dead.unwrap().queue : "")?)),
+    KvPage(v) => loadPage(api, RouteKv),
+    SettingsPage(v) => loadPage(api, RouteSettings),
+    NoticePage(a, b, c) => Ok(m.page),
+  };
+}
+
+// The first lines of a followed log; later ones come from the stream.
+export function fetchLines(api: Api, f: LogFilter, after: int, limit: int): Result<Msg[], string> {
+  const lines = logsAfter(api, f.app, f.level, f.contains, after, limit)?;
+  return Ok(lines.length > 0 ? [LinesArrived(lines)] : []);
+}
+
+function appName(m: Model): string {
+  return match (m.page) {
+    AppPage(v) => v.detail.name,
+    _ => "",
+  };
+}
+
+function appTab(m: Model): AppTab {
+  return match (m.page) {
+    AppPage(v) => v.tab,
+    _ => TabOverview,
+  };
+}
+
+// The messages that follow a user message `msg` against the model `m` (the state before `msg` is applied).
+export function perform(api: Api, m: Model, msg: Msg): Msg[] {
+  return match (msg) {
+    Refresh => reloadMsgs(api, m, noFlash()),
+    RunNow => runAndReload(api, m),
+    ActivateConfirmed(id) => activateAndReload(api, m, id),
+    DeleteForm(encoded) => deleteApp_(api, m, encoded),
+    ShowKv(ns) => showKv(api, m, ns),
+    Redrive(q) => redriveAndReload(api, m, q),
+    ShowDead(q) => showDead(api, q),
+    PublishForm(encoded) => publishAndReload(api, m, encoded),
+    FilterForm(encoded) => m.logs.following ? firstLines(api, filterOf(encoded)) : [],
+    ToggleFollow => m.logs.following ? [] : firstLines(api, m.logs.filter),
+    _ => [],
+  };
+}
+
+function filterOf(encoded: string): LogFilter {
+  return LogFilter {
+    app: formField(encoded, "app").trim(),
+    level: formField(encoded, "level"),
+    contains: formField(encoded, "contains"),
+  };
+}
+
+function firstLines(api: Api, f: LogFilter): Msg[] {
+  const r = fetchLines(api, f, 0, 100);
+  return r.isOk() ? r.unwrap() : fail(r.unwrapErr());
+}
+
+function reloadMsgs(api: Api, m: Model, flash: Flash): Msg[] {
+  const p = reload(api, m);
+  if (p.isErr()) {
+    return fail(p.unwrapErr());
+  }
+  return [Show(p.unwrap()), Notice(flash)];
+}
+
+function reloadApp(api: Api, m: Model): Result<Page, string> {
+  return Ok(AppPage(loadApp(api, appName(m), appTab(m), "")?));
+}
+
+function runAndReload(api: Api, m: Model): Msg[] {
+  const app = appName(m);
+  if (app.length == 0) {
+    return [];
+  }
+  const r = runNow(api, app);
+  if (r.isErr()) {
+    return fail(r.unwrapErr());
+  }
+  const run = r.unwrap();
+  const page = reloadApp(api, m);
+  const text = "Run " + run.id + " " + run.status
+      + (run.exitCode.isSome() ? ", exit " + run.exitCode.unwrap().toString() : "");
+  const flash = Flash { text: text, href: "/runs/" + run.id, bad: run.status != "succeeded" };
+  if (page.isErr()) {
+    return [Notice(flash)];
+  }
+  return [Show(page.unwrap()), Notice(flash)];
+}
+
+function deleteApp_(api: Api, m: Model, encoded: string): Msg[] {
+  const app = appName(m);
+  if (app.length == 0) {
+    return [];
+  }
+  if (formField(encoded, "confirm").trim() != app) {
+    return [Notice(badFlash("Type the app's name (" + app + ") to confirm"))];
+  }
+  const r = deleteApp(api, app);
+  if (r.isErr()) {
+    return fail(r.unwrapErr());
+  }
+  return [
+    CloseDialog,
+    Show(
+      NoticePage(
+        "Deleted " + app,
+        "The app, its deployments, runs, logs and data are gone.",
+        false,
+      ),
+    ),
+    Notice(noFlash()),
+  ];
+}
+
+function activateAndReload(api: Api, m: Model, id: int): Msg[] {
+  const app = appName(m);
+  if (app.length == 0) {
+    return [];
+  }
+  const r = activate(api, app, id);
+  if (r.isErr()) {
+    return [CloseDialog, Notice(badFlash(r.unwrapErr()))];
+  }
+  const page = reloadApp(api, m);
+  if (page.isErr()) {
+    return [CloseDialog, Notice(badFlash(page.unwrapErr()))];
+  }
+  return [
+    CloseDialog,
+    Show(page.unwrap()),
+    Notice(goodFlash("Deployment " + id.toString() + " is active", "")),
+  ];
+}
+
+function showKv(api: Api, m: Model, ns: string): Msg[] {
+  const r = kvEntries(api, appName(m), ns, 200);
+  if (r.isErr()) {
+    return fail(r.unwrapErr());
+  }
+  return [ShowKvEntries(KvView { namespace: ns, entries: r.unwrap() })];
+}
+
+function redriveAndReload(api: Api, m: Model, q: string): Msg[] {
+  const r = redrive(api, q);
+  if (r.isErr()) {
+    return fail(r.unwrapErr());
+  }
+  const open = match (m.page) {
+    QueuesPage(v) => v.dead.isSome() ? v.dead.unwrap().queue : "",
+    _ => "",
+  };
+  const v = loadQueues(api, open);
+  if (v.isErr()) {
+    return fail(v.unwrapErr());
+  }
+  return [
+    Show(QueuesPage(v.unwrap())),
+    Notice(goodFlash("Redrove " + r.unwrap().toString() + " dead letter(s) of " + q, "")),
+  ];
+}
+
+function showDead(api: Api, q: string): Msg[] {
+  const r = deadLetters(api, q, 100);
+  if (r.isErr()) {
+    return fail(r.unwrapErr());
+  }
+  return [ShowDeadLetters(DeadView { queue: q, letters: r.unwrap() })];
+}
+
+function publishAndReload(api: Api, m: Model, encoded: string): Msg[] {
+  const queue = formField(encoded, "queue").trim();
+  const body = formField(encoded, "body");
+  if (queue.length == 0) {
+    return fail("Give the queue a name (a-z, 0-9, -)");
+  }
+  const r = publish(api, queue, body);
+  if (r.isErr()) {
+    return fail(r.unwrapErr());
+  }
+  const open = match (m.page) {
+    QueuesPage(v) => v.dead.isSome() ? v.dead.unwrap().queue : "",
+    _ => "",
+  };
+  const v = loadQueues(api, open);
+  if (v.isErr()) {
+    return [CloseDialog, ClearDraft, Notice(badFlash(v.unwrapErr()))];
+  }
+  return [
+    CloseDialog,
+    ClearDraft,
+    Show(QueuesPage(v.unwrap())),
+    Notice(goodFlash("Queued message " + r.unwrap().toString() + " on " + queue, "")),
+  ];
+}

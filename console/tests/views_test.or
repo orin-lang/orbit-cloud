@@ -1,0 +1,567 @@
+// The views as orin-ui sees them: rendered HTML, the tree's event handlers, and the patches a change produces.
+import { assert, assertEq, assertEqString } from "std:test";
+import { JsonValue } from "std:json";
+import {
+  Dom, Session, sessionOf, send, renderHtml, messageAt, apply, Create, Remove, Replace, SetAttr,
+  SetText, unsorted, SortState,
+} from "orin-ui";
+import { AppSummary, LogLine, Run, Queue, DeadView, DeadLetter } from "../src/types";
+import {
+  Model, Msg, Page, initialModel, AppsPage, AppsData, AppRow, LogsPage, NoticePage, LinesArrived,
+  ToggleFollow, Notice, goodFlash, OpenDialog, ConfirmDelete, ConfirmActivate, PublishDialog,
+  RunNow, SortApps, ToggleRaw, ShowDiff, ClearLines, Show, CloseDialog, NoDialog, TabDeployments,
+  TabOverview, TabKv, TabLogs, TabRuns, TabSettings, DeleteForm, ActivateConfirmed, ShowDead,
+  Redrive, SelectKey, ShowKv, ShowDeadLetters,
+} from "../src/model";
+import {
+  Route, RouteOverview, RouteApps, RouteApp, RouteRuns, RouteRun, RouteLogs, RouteQueues, RouteKv,
+  RouteSettings,
+} from "../src/effects";
+import { program } from "../src/program";
+import { delta, durationAxis } from "../src/views_overview";
+import { specChanges } from "../src/views_apps";
+import { parseJson } from "../src/jv";
+import { modelAfter, pathIn } from "./support";
+
+function render(m: Model): string {
+  return renderHtml(sessionOf<Model, Msg>(program(), m).dom);
+}
+
+function page(route: Route): string {
+  return render(modelAfter(route, []));
+}
+
+function msgAt(m: Model, path: int[], event: string): Option<Msg> {
+  return messageAt<Msg>(sessionOf<Model, Msg>(program(), m).tree, path, event, "");
+}
+
+function step(m: Model, msg: Msg): Model {
+  return send<Model, Msg>(program(), sessionOf<Model, Msg>(program(), m), msg).session.model;
+}
+
+function line(id: int): LogLine {
+  return LogLine {
+    id: id,
+    app: "a",
+    level: "info",
+    message: "m" + id.toString(),
+    ts: 1792336580000,
+    runId: "",
+  };
+}
+
+function json(text: string): JsonValue {
+  return parseJson(text).unwrap();
+}
+
+// ------------------------------------------------------------------ the shell
+
+@Test
+function everyScreenHasTheShellWithTheRightItemActive(): void {
+  const cases: string[][] = [
+    ["Overview", "/"],
+    ["Apps", "/apps"],
+    ["Runs", "/runs"],
+    ["Logs", "/logs"],
+    ["Queues", "/queues"],
+    ["KV", "/kv"],
+    ["Settings", "/settings"],
+  ];
+  const routes = [
+    RouteOverview,
+    RouteApps,
+    RouteRuns,
+    RouteLogs,
+    RouteQueues,
+    RouteKv,
+    RouteSettings,
+  ];
+  let i: usize = 0;
+  while (i < routes.length) {
+    const h = page(routes[i]);
+    assert(
+      h.includes("<aside class=\"ou-sidebar\">") && h.includes("<header class=\"ou-topbar\">"),
+      "shell on " + cases[i][0],
+    );
+    assert(
+      h.includes("class=\"ou-nav-item active\" href=\"" + cases[i][1] + "\""),
+      "the active item of " + cases[i][0] + ": " + h,
+    );
+    assertEq(
+      h.split("ou-nav-item active").length.toInt(),
+      2,
+      "exactly one active item on " + cases[i][0],
+    );
+    i += 1;
+  }
+}
+
+@Test
+function theShellShowsTheNodeTheThemeToggleAndTheUserMenu(): void {
+  const h = page(RouteOverview);
+  assert(
+    h.includes("Online") && h.includes("orbitd:8080") && h.includes("1 worker"),
+    "node status: " + h,
+  );
+  assert(h.includes("data-ou-theme-toggle"), "theme toggle");
+  assert(
+    h.includes("<details class=\"ou-menu\">")
+        && h.includes("action=\"/logout\"")
+        && h.includes("Sign out"),
+    "user menu with sign-out",
+  );
+  for (const item of ["Overview", "Apps", "Runs", "Logs", "Queues", "KV", "Settings"]) {
+    assert(h.includes("<span class=\"ou-nav-label\">" + item + "</span>"), "sidebar item " + item);
+  }
+  assert(h.includes("Orbit Cloud"), "wordmark");
+  assert(h.includes("orbitd 0.1.0"), "version in the sidebar footer");
+}
+
+@Test
+function anUnreachableNodeIsShownInTheTopBar(): void {
+  const m = initialModel(NoticePage("x", "y", false), None, "orbitd:8080");
+  assert(render(m).includes("orbitd unreachable"), "unreachable");
+}
+
+// ------------------------------------------------------------------ escaping and structure
+
+@Test
+function textFromTheApiIsNeverMarkup(): void {
+  const evil = AppSummary {
+    name: "<script>alert(1)</script>",
+    kind: "job\"><b>",
+    version: 1,
+    workerRunning: false,
+    createdAt: 0,
+  };
+  const m = initialModel(
+    AppsPage(AppsData {
+      rows: [AppRow { app: evil, last: None, trend: [], runs24: 0 }],
+      sort: unsorted(),
+      now: 0,
+    }),
+    None,
+    "n",
+  );
+  const h = render(m);
+  assert(!h.includes("<script"), "no script element");
+  assert(!h.includes("<b>"), "no injected element");
+  assert(h.includes("&lt;script&gt;alert(1)&lt;/script&gt;"), "escaped text");
+  assert(
+    h.includes("href=\"/apps/%3Cscript%3Ealert%281%29%3C%2Fscript%3E\""),
+    "link is percent-encoded: " + h,
+  );
+}
+
+@Test
+function tablesUseTheStructureABrowserKeeps(): void {
+  // a <tr> directly inside <table> would get a <tbody> from the HTML parser and the paths of the patch stream would no longer
+  // match the DOM
+  for (const r of [
+    RouteApps,
+    RouteRuns,
+    RouteKv,
+    RouteOverview,
+    RouteApp("hello", TabDeployments, ""),
+  ]) {
+    const h = page(r);
+    assert(!h.includes("<table class=\"ou-table\"><tr"), "no tr straight in table");
+    assert(h.includes("<thead>") && h.includes("<tbody>"), "thead and tbody");
+  }
+}
+
+// ------------------------------------------------------------------ overview
+
+@Test
+function theOverviewShowsEveryStatAndBothCharts(): void {
+  const h = page(RouteOverview);
+  for (const label of [
+    "Apps",
+    "Runs, last 24 h",
+    "Error rate",
+    "p95 run time",
+    "Queue backlog",
+    "Dead letters",
+    "Active workers",
+    "Log lines, last 24 h",
+  ]) {
+    assert(h.includes("<div class=\"ou-stat-label\">" + label + "</div>"), "stat card " + label);
+  }
+  assert(
+    h.includes("aria-labelledby=\"c-runs-per-hour-t c-runs-per-hour-d\""),
+    "runs chart is labelled",
+  );
+  assert(h.includes("Run time per hour"), "duration chart");
+  assert(
+    h.includes("class=\"ou-bar ou-fill-0\"") && h.includes("class=\"ou-bar ou-fill-1\""),
+    "stacked succeeded and failed bars",
+  );
+  assert(h.split("class=\"ou-xtick\"").length > 10, "x tick labels");
+  assert(h.includes(">4.1 ms<") || h.includes("4.10 ms"), "p95 from the totals: " + h);
+  assert(
+    h.includes("Latest failed runs") && h.includes("href=\"/runs/def\""),
+    "latest failed runs link to the run",
+  );
+  assert(
+    h.includes("Queues needing attention") && h.includes("1 dead"),
+    "queues needing attention",
+  );
+  assert(h.includes("href=\"/apps/hello\""), "latest runs link to apps");
+}
+
+@Test
+function deltasAreRelativeChanges(): void {
+  assertEqString(delta(120, 100), "+20%", "up");
+  assertEqString(delta(80, 100), "-20%", "down");
+  assertEqString(delta(5, 0), "new", "from nothing");
+  assertEqString(delta(0, 0), "", "nothing to nothing");
+  assertEqString(delta(100, 100), "0%", "no change");
+  assertEqString(durationAxis(0), "0", "zero");
+  assertEqString(durationAxis(20000), "20 ms", "round milliseconds");
+  assertEqString(durationAxis(2000000), "2 s", "seconds");
+  assertEqString(durationAxis(1500), "1.50 ms", "other values keep their precision");
+}
+
+// ------------------------------------------------------------------ apps
+
+@Test
+function theAppsTableHasSparklinesPillsAndSortableHeaders(): void {
+  const h = page(RouteApps);
+  assert(
+    h.includes("class=\"ou-spark\"") && h.includes("hello: runs in the last 24 hours"),
+    "sparkline per app",
+  );
+  assert(
+    h.includes("ou-pill ou-tone-success") && h.includes("never run"),
+    "last run status and apps without runs",
+  );
+  assert(h.includes("aria-sort=\"none\""), "sortable headers");
+  assert(h.includes("running"), "a consumer's worker state");
+  const sorted = step(modelAfter(RouteApps, []), SortApps("name"));
+  assert(render(sorted).includes("aria-sort=\"ascending\""), "the sorted column says so");
+  const desc = step(sorted, SortApps("name"));
+  const firstDesc = render(desc).indexOf("href=\"/apps/worker\"").unwrap();
+  const firstAsc = render(sorted).indexOf("href=\"/apps/worker\"").unwrap();
+  const helloDesc = render(desc).indexOf("href=\"/apps/hello\"").unwrap();
+  assert(firstDesc < helloDesc, "descending puts worker before hello");
+  assert(
+    render(sorted).indexOf("href=\"/apps/hello\"").unwrap() < firstAsc,
+    "ascending puts hello first",
+  );
+}
+
+@Test
+function anAppHasTabsAndRunButtonsDependOnItsKind(): void {
+  const h = page(RouteApp("hello", TabOverview, ""));
+  for (const tab of ["Overview", "Deployments", "Runs", "Logs", "KV", "Settings"]) {
+    assert(h.includes("role=\"tab\"") && h.includes(">" + tab), "tab " + tab);
+  }
+  assert(h.includes("href=\"/apps/hello/deployments\""), "tabs are links");
+  assert(h.includes("aria-selected=\"true\""), "selected tab");
+  assert(h.includes("Run now"), "jobs can be run");
+  assert(!page(RouteApp("svc", TabOverview, "")).includes("Run now"), "services run by themselves");
+  assert(h.includes("class=\"ou-crumbs\"") && h.includes("href=\"/apps\""), "breadcrumbs");
+}
+
+@Test
+function deploymentsShowReadableSpecGroupsAndAConfirmedActivation(): void {
+  const m = modelAfter(RouteApp("hello", TabDeployments, ""), []);
+  const h = render(m);
+  assert(
+    h.includes("<h3 class=\"ou-kv-title\">Limits</h3>")
+        && h.includes("<h3 class=\"ou-kv-title\">Capabilities</h3>")
+        && h.includes("<h3 class=\"ou-kv-title\">Environment</h3>"),
+    "groups",
+  );
+  assert(h.includes("128 MiB"), "memory with its unit");
+  assert(h.includes(">5 s<"), "timeout as a duration: " + h);
+  assert(h.includes("REGION") && h.includes("eu-west"), "environment variables");
+  assert(h.includes("cfg, seen"), "kv namespaces");
+  assert(!h.includes("&quot;memory_mb&quot;"), "no raw JSON by default");
+  assert(render(step(m, ToggleRaw)).includes("ou-json"), "raw JSON on request");
+  // newest version first, the active one marked, the other can be activated after a confirmation
+  assert(h.indexOf(">v2<").unwrap() < h.indexOf(">v1<").unwrap(), "newest first");
+  assert(h.includes("ou-pill ou-tone-success"), "active pill");
+  const activate = msgAt(m, pathIn(m, "button", "Activate"), "click");
+  assert(
+    activate.isSome()
+        && match (activate.unwrap()) {
+          OpenDialog(d) => match (d) {
+            ConfirmActivate(id) => id == 1,
+            _ => false,
+          },
+          _ => false,
+        },
+    "Activate opens the confirmation",
+  );
+  const open = step(m, OpenDialog(ConfirmActivate(1)));
+  const dialog = render(open);
+  assert(
+    dialog.includes("role=\"dialog\"") && dialog.includes("Make this version active?"),
+    "confirmation dialog",
+  );
+  const confirm = msgAt(open, pathIn(open, "button", "Activate version"), "click");
+  assert(
+    confirm.isSome()
+        && match (confirm.unwrap()) {
+          ActivateConfirmed(id) => id == 1,
+          _ => false,
+        },
+    "the confirm button activates",
+  );
+}
+
+@Test
+function comparingVersionsListsTheChangedSettings(): void {
+  const before = json(
+    "{\"kind\":\"job\",\"limits\":{\"memory_mb\":64},\"kv_namespaces\":[\"cfg\"]}",
+  );
+  const after = json(
+    "{\"kind\":\"job\",\"limits\":{\"memory_mb\":128},\"kv_namespaces\":[\"cfg\"],\"env\":{\"REGION\":\"eu\"}}",
+  );
+  const changes = specChanges(before, after);
+  assertEq(changes.length.toInt(), 2, "two changes");
+  assertEqString(changes[0].path, "limits.memory_mb", "nested path");
+  assertEqString(changes[0].before, "64", "before");
+  assertEqString(changes[0].after, "128", "after");
+  assertEqString(changes[1].path, "env.REGION", "added");
+  assertEqString(changes[1].before, "(absent)", "absent before");
+  assertEq(specChanges(before, before).length.toInt(), 0, "same spec, no changes");
+  const m = modelAfter(RouteApp("hello", TabDeployments, ""), [ShowDiff(2)]);
+  const h = render(m);
+  assert(h.includes("Changes: Version 1 to version 2"), "the diff card: " + h);
+  assert(
+    h.includes("limits.memory_mb") && h.includes("ou-diff-old") && h.includes("ou-diff-new"),
+    "changed rows",
+  );
+  assert(h.includes("The module changed"), "module change noticed");
+  assert(
+    render(modelAfter(RouteApp("hello", TabDeployments, ""), [ShowDiff(1)])).includes(
+      "nothing to compare",
+    ),
+    "the first version has no predecessor",
+  );
+}
+
+@Test
+function theKvTabListsNamespacesEntriesAndAValueViewer(): void {
+  const empty = render(modelAfter(RouteApp("hello", TabKv, ""), []));
+  assert(
+    empty.includes("Choose a namespace") && empty.includes("ou-listbtn"),
+    "namespace list: " + empty,
+  );
+  const open = modelAfter(RouteApp("hello", TabKv, "cfg"), []);
+  const h = render(open);
+  assert(h.includes("ou-listbtn active"), "the open namespace is marked");
+  assert(h.includes(">color<") && h.includes("4 B"), "entries");
+  assert(!h.includes("<script>"), "values are never markup");
+  const viewed = render(step(open, SelectKey("color")));
+  assert(
+    viewed.includes("<h2 class=\"ou-card-title\">color</h2>") && viewed.includes("blue"),
+    "the value viewer",
+  );
+  assert(
+    render(modelAfter(RouteApp("svc", TabKv, ""), [])).includes("No KV data"),
+    "an app without namespaces",
+  );
+}
+
+@Test
+function theSettingsTabHasATypedNameDeletion(): void {
+  const m = modelAfter(RouteApp("hello", TabSettings, ""), []);
+  assert(render(m).includes("Danger zone"), "danger zone");
+  const open = step(m, OpenDialog(ConfirmDelete));
+  const h = render(open);
+  assert(
+    h.includes("Type hello to confirm") && h.includes("name=\"confirm\""),
+    "typed-name field: " + h,
+  );
+  assert(h.includes("This cannot be undone."), "warning");
+  const submit = messageAt<Msg>(
+    sessionOf<Model, Msg>(program(), open).tree,
+    pathIn(open, "form", "Delete app"),
+    "submit",
+    "confirm=hello",
+  );
+  assert(
+    submit.isSome()
+        && match (submit.unwrap()) {
+          DeleteForm(v) => v == "confirm=hello",
+          _ => false,
+        },
+    "the form sends its fields",
+  );
+}
+
+// ------------------------------------------------------------------ runs
+
+@Test
+function aRunShowsItsResourcesWaterfallAndLogs(): void {
+  const h = page(RouteRun("abc"));
+  assert(
+    h.includes("Execution time") && h.includes("546 ms"),
+    "duration with sensible precision: " + h,
+  );
+  assert(h.includes("1.7 MiB"), "memory");
+  assert(h.includes("whole run 546 ms"), "the run span");
+  assert(h.includes("ou-pill ou-tone-success"), "status pill");
+  assert(h.includes("class=\"wf-tick\""), "time axis");
+  assert(h.includes("left:0.0%;width:100.0%"), "the root span covers the whole trace");
+  assert(h.includes("left:0.0%;width:18.3%"), "load: 100000 / 546000");
+  assert(h.includes("left:18.3%;width:81.6%"), "execute starts where load ends");
+  assert(h.includes("wf-name child"), "child spans are indented");
+  assert(h.includes("logline lvl-info") && h.includes("line 1"), "log lines with a level class");
+  assert(h.includes("href=\"/apps/hello\""), "link to the app");
+}
+
+// ------------------------------------------------------------------ logs and queues
+
+@Test
+function liveLinesAreNewestFirstForTheReversedBox(): void {
+  let m = step(initialModel(LogsPage, None, "n"), ToggleFollow);
+  m = step(m, LinesArrived([line(1), line(2)]));
+  const h = render(m);
+  assert(h.includes("class=\"logbox\""), "the live box");
+  assert(
+    h.indexOf("m2").unwrap() < h.indexOf("m1").unwrap(),
+    "the newest line comes first in the markup",
+  );
+  assert(h.includes("Pause") && h.includes("Live"), "following");
+}
+
+@Test
+function aNewLogLineIsOnePatchNotARerender(): void {
+  const p = program();
+  let m = step(initialModel(LogsPage, None, "n"), ToggleFollow);
+  m = step(m, LinesArrived([line(1), line(2), line(3)]));
+  const before = sessionOf<Model, Msg>(p, m);
+  const next = send<Model, Msg>(p, before, LinesArrived([line(4)]));
+  assertEq(next.patches.length.toInt(), 2, "one new line and the count in the card header");
+  const created = match (next.patches[0]) {
+    Create(path, node) => true,
+    _ => match (next.patches[1]) {
+      Create(path, node) => true,
+      _ => false,
+    },
+  };
+  assert(created, "a Create patch");
+  assertEqString(
+    renderHtml(apply(before.dom, next.patches).unwrap()),
+    renderHtml(next.session.dom),
+    "apply(old, patches) == new",
+  );
+}
+
+@Test
+function clearingAndEmptyStatesInTheLog(): void {
+  const idle = render(initialModel(LogsPage, None, "n"));
+  assert(idle.includes("Press Follow"), "not following: how to start");
+  const waiting = render(step(initialModel(LogsPage, None, "n"), ToggleFollow));
+  assert(waiting.includes("Waiting for log lines"), "following without lines: a loading state");
+  let m = step(step(initialModel(LogsPage, None, "n"), ToggleFollow), LinesArrived([line(1)]));
+  m = step(m, ClearLines);
+  assert(!render(m).includes("m1"), "gone");
+}
+
+@Test
+function queuesShowCountsDeadLettersAndAPublishDialog(): void {
+  const m = modelAfter(RouteQueues, []);
+  const h = page(RouteQueues);
+  assert(
+    h.includes("<h2 class=\"ou-card-title\">orders</h2>") && h.includes("1 dead"),
+    "a card per queue",
+  );
+  assert(h.includes("class=\"qcount bad\""), "dead count is marked");
+  assert(
+    h.includes("Dead letters") && h.includes("Redrive"),
+    "controls only where there are dead letters",
+  );
+  const publish = msgAt(m, pathIn(m, "button", "Publish message"), "click");
+  assert(
+    publish.isSome()
+        && match (publish.unwrap()) {
+          OpenDialog(d) => match (d) {
+            PublishDialog => true,
+            _ => false,
+          },
+          _ => false,
+        },
+    "Publish message opens the dialog",
+  );
+  const open = step(m, OpenDialog(PublishDialog));
+  const d = render(open);
+  assert(
+    d.includes("Publish a message") && d.includes("name=\"queue\"") && d.includes("name=\"body\""),
+    "the form in the dialog: " + d,
+  );
+  const dead = render(
+    modelAfter(
+      RouteQueues,
+      [
+        ShowDeadLetters(DeadView {
+          queue: "orders",
+          letters: [DeadLetter { id: 7, body: "{}", attempts: 3, lastError: "boom" }],
+        }),
+      ],
+    ),
+  );
+  assert(
+    dead.includes("Dead letters of orders")
+        && dead.includes("boom")
+        && dead.includes("Redrive all"),
+    "the list opens",
+  );
+  assert(
+    render(modelAfter(RouteKv, [])).includes("Browse"),
+    "the kv overview links into the app's KV tab",
+  );
+}
+
+@Test
+function emptyStatesExplainWhatToDo(): void {
+  const apps = initialModel(AppsPage(AppsData { rows: [], sort: unsorted(), now: 0 }), None, "n");
+  assert(render(apps).includes("No apps yet") && render(apps).includes("occtl deploy"), "no apps");
+  assert(!render(apps).includes("<table"), "no table");
+}
+
+// ------------------------------------------------------------------ patches
+
+@Test
+function openingADialogAddsAnOverlayAndNothingElseChanges(): void {
+  const p = program();
+  const m = modelAfter(RouteQueues, []);
+  const before = sessionOf<Model, Msg>(p, m);
+  const next = send<Model, Msg>(p, before, OpenDialog(PublishDialog));
+  assertEq(next.patches.length.toInt(), 1, "one patch");
+  assert(
+    match (next.patches[0]) {
+      Create(path, node) => path.length == 2,
+      _ => false,
+    },
+    "a new overlay next to the page",
+  );
+  const closed = send<Model, Msg>(p, next.session, CloseDialog);
+  assertEq(closed.patches.length.toInt(), 1, "and one patch to remove it");
+}
+
+@Test
+function theToastAppearsAsASinglePatch(): void {
+  const p = program();
+  const before = sessionOf<Model, Msg>(p, modelAfter(RouteApp("hello", TabOverview, ""), []));
+  const next = send<Model, Msg>(p, before, Notice(goodFlash("saved", "/runs/x")));
+  assertEq(next.patches.length.toInt(), 1, "one patch");
+  assert(renderHtml(next.session.dom).includes("ou-toast"), "a toast");
+  assertEqString(
+    renderHtml(apply(before.dom, next.patches).unwrap()),
+    renderHtml(next.session.dom),
+    "patches match",
+  );
+}
+
+@Test
+function theNoticePageLinksBack(): void {
+  const h = render(initialModel(NoticePage("Deleted x", "gone", false), None, "n"));
+  assert(h.includes("Deleted x") && h.includes("href=\"/apps\""), "title and link");
+  const bad = render(initialModel(NoticePage("Cannot reach orbitd", "refused", true), None, "n"));
+  assert(bad.includes("role=\"alert\"") && bad.includes("refused"), "errors are alerts");
+}

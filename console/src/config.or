@@ -1,0 +1,123 @@
+// Command-line options of the console. Orin's std has no way to read environment variables, so the tokens come from arguments
+// or, better (an argument shows in `ps`), from files.
+export type Config = {
+  listenAddress: string;
+  listenPort: int;
+  apiHost: string;
+  apiPort: int;
+  apiToken: string;
+  apiTokenFile: string;
+  consoleToken: string;
+  consoleTokenFile: string;
+  assetsDir: string;
+  clientDir: string;
+  workers: int;
+  accessLog: bool;
+};
+
+export function defaultConfig(): Config {
+  return Config {
+    listenAddress: "127.0.0.1",
+    listenPort: 8081,
+    apiHost: "127.0.0.1",
+    apiPort: 8080,
+    apiToken: "",
+    apiTokenFile: "",
+    consoleToken: "",
+    consoleTokenFile: "",
+    assetsDir: "assets",
+    clientDir: ".orin/packages/orin-ui/client",
+    workers: 4,
+    accessLog: true,
+  };
+}
+
+export function usage(): string {
+  return "usage: orbit-console [options]\n"
+      + "  --listen ADDR:PORT        where the console listens (default 127.0.0.1:8081)\n"
+      + "  --api URL                 orbitd, http://HOST:PORT (default http://127.0.0.1:8080)\n"
+      + "  --api-token TOKEN         bearer token for orbitd (visible in ps; prefer --api-token-file)\n"
+      + "  --api-token-file FILE     read the orbitd token from FILE\n"
+      + "  --console-token TOKEN     the secret that signs in to the console (default: the orbitd token)\n"
+      + "  --console-token-file FILE\n"
+      + "  --assets DIR              directory with console.css (default assets)\n"
+      + "  --client-dir DIR          orin-ui's client/ directory: orin-ui.js, orin-ui-kit.css and .js (default .orin/packages/orin-ui/client)\n"
+      + "  --workers N               parallel requests to orbitd (default 4)\n"
+      + "  --quiet                   no access log\n";
+}
+
+// "HOST:PORT" -> the pieces; the last colon splits, so a bracketed IPv6 address works.
+export function splitHostPort(text: string): Result<string[], string> {
+  const parts = text.split(":");
+  if (parts.length < 2) {
+    return Err("expected HOST:PORT, found '" + text + "'");
+  }
+  const portText = parts[parts.length - 1];
+  const host = text.substring(0, text.length - portText.length - 1);
+  const port = parseInt(portText);
+  if (host.length == 0 || port.isNone() || port.unwrap() < 0 || port.unwrap() > 65535) {
+    return Err("expected HOST:PORT, found '" + text + "'");
+  }
+  return Ok([host, portText]);
+}
+
+function stripScheme(url: string): Result<string, string> {
+  if (url.startsWith("http://")) {
+    const rest = url.substring(7, url.length);
+    const slash = rest.indexOf("/");
+    return Ok(slash.isSome() ? rest.substring(0, slash.unwrap()) : rest);
+  }
+  if (url.startsWith("https://")) {
+    return Err(
+      "https is not supported (put orbitd on a trusted network or behind a local TLS proxy): "
+          + url,
+    );
+  }
+  return Ok(url);
+}
+
+export function parseArgs(argv: string[]): Result<Config, string> {
+  let c = defaultConfig();
+  let i: usize = 0;
+  while (i < argv.length) {
+    const a = argv[i];
+    if (a == "--quiet") {
+      c = Config { ...c, accessLog: false };
+      i += 1;
+    } else {
+      if (i + 1 >= argv.length) {
+        return Err("option " + a + " needs a value");
+      }
+      const v = argv[i + 1];
+      if (a == "--listen") {
+        const hp = splitHostPort(v)?;
+        c = Config { ...c, listenAddress: hp[0], listenPort: parseInt(hp[1]).unwrap() };
+      } else if (a == "--api") {
+        const hp = splitHostPort(stripScheme(v)?)?;
+        c = Config { ...c, apiHost: hp[0], apiPort: parseInt(hp[1]).unwrap() };
+      } else if (a == "--api-token") {
+        c = Config { ...c, apiToken: v };
+      } else if (a == "--api-token-file") {
+        c = Config { ...c, apiTokenFile: v };
+      } else if (a == "--console-token") {
+        c = Config { ...c, consoleToken: v };
+      } else if (a == "--console-token-file") {
+        c = Config { ...c, consoleTokenFile: v };
+      } else if (a == "--assets") {
+        c = Config { ...c, assetsDir: v };
+      } else if (a == "--client-dir") {
+        c = Config { ...c, clientDir: v };
+      } else if (a == "--workers") {
+        const n = parseInt(v);
+        if (n.isNone() || n.unwrap() < 1 || n.unwrap() > 64) {
+          return Err("--workers takes 1 to 64");
+        }
+        c = Config { ...c, workers: n.unwrap() };
+      } else {
+        return Err("unknown option " + a);
+      }
+      i += 2;
+    }
+  }
+  return Ok(c);
+}
