@@ -352,7 +352,7 @@ impl Executor {
     /// # Errors
     /// When the directory exists and cannot be removed.
     pub fn remove_app_files(&self, app: &str) -> std::io::Result<()> {
-        debug_assert!(oc_store::valid_name(app), "app names are validated");
+        debug_assert!(oc_store::valid_key(app), "app keys are validated");
         match std::fs::remove_dir_all(self.files_root.join(app)) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
@@ -382,6 +382,14 @@ impl Executor {
         let spec: Spec = match serde_json::from_value(d.spec.clone()) {
             Ok(s) => s,
             Err(e) => return failed(format!("stored spec is invalid: {e}")),
+        };
+        let spec = if spec.http {
+            match self.store.http_port(&d.app) {
+                Ok(port) => spec.with_http_port(port),
+                Err(e) => return failed(e.to_string()),
+            }
+        } else {
+            spec
         };
         // load: the runtime caches compiled artifacts by content hash, so this is cheap after the first run
         let t = now_us();

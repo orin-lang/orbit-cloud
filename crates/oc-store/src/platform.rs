@@ -1397,6 +1397,25 @@ impl Store {
         Ok(port)
     }
 
+    /// Pins the loopback port of an app (tests, manual operation). Replaces the app's current port.
+    ///
+    /// # Errors
+    /// [`StoreError::Conflict`] when another app has the port.
+    pub fn assign_http_port(&self, app: &str, port: u16) -> Result<()> {
+        let db = self.db();
+        db.execute("DELETE FROM app_ports WHERE app = ?1", params![app])?;
+        let n = db.execute(
+            "INSERT OR IGNORE INTO app_ports (app, port) VALUES (?1, ?2)",
+            params![app, i64::from(port)],
+        )?;
+        drop(db);
+        self.bump();
+        if n == 0 {
+            return conflict(format!("port {port} belongs to another app"));
+        }
+        Ok(())
+    }
+
     /// The port of an app, when it has one.
     ///
     /// # Errors

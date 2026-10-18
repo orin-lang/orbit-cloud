@@ -233,7 +233,11 @@ impl Node {
         spec: Spec,
         mut stop: watch::Receiver<bool>,
     ) {
-        let Some(queue) = spec.queue.clone() else {
+        let Some(queue) = spec
+            .queue
+            .as_deref()
+            .map(|q| oc_store::key_of(oc_store::split_key(&d.app).0, q))
+        else {
             return;
         };
         let max_attempts = spec.max_attempts.unwrap_or(DEFAULT_MAX_ATTEMPTS);

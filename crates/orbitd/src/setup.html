@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orbit Cloud setup</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fff; --fg:#14181f; --muted:#5b6472; --line:#d5dae1; --accent:#2b5fd9; --err:#b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#12151b; --fg:#e8ebf0; --muted:#98a1b0; --line:#2b323d; --accent:#7ea2ff; --err:#ff8a80; } }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, sans-serif; }
+  main { max-width: 26rem; margin: 10vh auto; padding: 0 16px; }
+  h1 { font-size: 1.4rem; }
+  p { color: var(--muted); }
+  label { display:block; margin-top: 1rem; font-weight: 600; }
+  input { width:100%; box-sizing:border-box; padding:.55rem .6rem; margin-top:.25rem; border:1px solid var(--line); border-radius:6px; background:transparent; color:inherit; font:inherit; }
+  button { margin-top:1.4rem; padding:.6rem 1rem; border:0; border-radius:6px; background:var(--accent); color:#fff; font:inherit; cursor:pointer; }
+  #msg { margin-top:1rem; color:var(--err); min-height:1.5em; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Create the first owner</h1>
+  <p>This node has no users yet. The setup token is in the <code>orbitd</code> log.</p>
+  <form id="f">
+    <label>Setup token <input id="token" required autocomplete="off"></label>
+    <label>Email <input id="email" type="email" required autocomplete="username"></label>
+    <label>Name <input id="name" autocomplete="name"></label>
+    <label>Password (at least 10 characters) <input id="pw" type="password" minlength="10" required autocomplete="new-password"></label>
+    <button>Create owner</button>
+  </form>
+  <div id="msg" role="alert"></div>
+</main>
+<script>
+  document.getElementById('token').value = new URLSearchParams(location.search).get('token') || '';
+  document.getElementById('f').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const msg = document.getElementById('msg');
+    msg.textContent = '';
+    const r = await fetch('/v1/setup', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        token: document.getElementById('token').value.trim(),
+        email: document.getElementById('email').value,
+        display_name: document.getElementById('name').value,
+        password: document.getElementById('pw').value,
+      }),
+    });
+    if (r.ok) { location.href = '/'; return; }
+    const j = await r.json().catch(() => ({}));
+    msg.textContent = j.error || ('Setup failed (' + r.status + ')');
+  });
+</script>
+</body>
+</html>

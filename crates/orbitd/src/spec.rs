@@ -91,6 +91,9 @@ pub struct Spec {
     pub queue: Option<String>,
     /// Deliveries of a message before it is dead-lettered (consumer; default 5).
     pub max_attempts: Option<i64>,
+    /// A service that speaks HTTP: orbitd assigns a loopback port (env `PORT`, granted to listen on) and the gateway
+    /// proxies the project's routes to it.
+    pub http: bool,
 }
 
 impl Spec {
@@ -124,7 +127,21 @@ impl Spec {
         if matches!(self.max_attempts, Some(n) if !(1..=100).contains(&n)) {
             return Err("max_attempts must be 1..=100".into());
         }
+        if self.http && self.kind != Kind::Service {
+            return Err("`http` is for services".into());
+        }
         Ok(())
+    }
+
+    /// The spec with the loopback port of an HTTP service applied: `PORT` in the environment and a `listen` grant.
+    #[must_use]
+    pub fn with_http_port(mut self, port: u16) -> Self {
+        self.env.insert("PORT".into(), port.to_string());
+        let scope = format!("127.0.0.1:{port}");
+        if !self.listen.contains(&scope) {
+            self.listen.push(scope);
+        }
+        self
     }
 
     /// The Orbit limits of one run.
