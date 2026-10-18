@@ -26,10 +26,7 @@ async fn fx() -> Fx {
     let store = Arc::new(oc_store::Store::open(&dir.path().join("t.db")).unwrap());
     let exec = Arc::new(Executor::new(store, dir.path(), true).unwrap());
     let node = Node::new(exec);
-    let app = router(AppState {
-        node: Arc::clone(&node),
-        token: Some(Arc::from(TOKEN)),
-    });
+    let app = router(AppState::new(Arc::clone(&node), Some(Arc::from(TOKEN))));
     Fx {
         _dir: dir,
         app,

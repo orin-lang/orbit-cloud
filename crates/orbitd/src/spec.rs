@@ -91,6 +91,9 @@ pub struct Spec {
     pub queue: Option<String>,
     /// Deliveries of a message before it is dead-lettered (consumer; default 5).
     pub max_attempts: Option<i64>,
+    /// A service that speaks HTTP: orbitd assigns a loopback port (env `PORT`, granted to listen on) and the gateway
+    /// proxies the project's routes to it.
+    pub http: bool,
 }
 
 impl Spec {
@@ -124,7 +127,21 @@ impl Spec {
         if matches!(self.max_attempts, Some(n) if !(1..=100).contains(&n)) {
             return Err("max_attempts must be 1..=100".into());
         }
+        if self.http && self.kind != Kind::Service {
+            return Err("`http` is for services".into());
+        }
         Ok(())
+    }
+
+    /// The spec with the loopback port of an HTTP service applied: `PORT` in the environment and a `listen` grant.
+    #[must_use]
+    pub fn with_http_port(mut self, port: u16) -> Self {
+        self.env.insert("PORT".into(), port.to_string());
+        let scope = format!("127.0.0.1:{port}");
+        if !self.listen.contains(&scope) {
+            self.listen.push(scope);
+        }
+        self
     }
 
     /// The Orbit limits of one run.
@@ -229,6 +246,23 @@ mod tests {
         let bad: Spec =
             serde_json::from_value(serde_json::json!({"listen": ["nonsense"]})).unwrap();
         assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn http_services_get_a_loopback_port_and_env() {
+        let s: Spec =
+            serde_json::from_value(serde_json::json!({"kind": "service", "http": true})).unwrap();
+        s.validate().unwrap();
+        let s = s.with_http_port(20123);
+        assert_eq!(s.env.get("PORT").map(String::as_str), Some("20123"));
+        assert_eq!(s.listen, vec!["127.0.0.1:20123".to_owned()]);
+        let g = s.grants("app", None, None).unwrap();
+        assert!(
+            g.contains(&CapabilityId::net_v1()),
+            "the port is granted to listen on"
+        );
+        let job: Spec = serde_json::from_value(serde_json::json!({"http": true})).unwrap();
+        assert!(job.validate().is_err(), "http is for services");
     }
 
     #[test]

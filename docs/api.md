@@ -2,11 +2,19 @@
 
 `orbitd` serves JSON over HTTP on `--listen` (default `0.0.0.0:8080`).
 
-* `/v1/*` needs `Authorization: Bearer $ORBIT_CLOUD_TOKEN` (when the node has a token). The log stream also accepts
-  `?token=...`.
-* `/healthz`, `/metrics` and `/` (the console) are open.
-* Errors are `{"error": "message"}` with the status: 400 bad input, 401 auth, 404 not found, 409 conflict (a stale
-  lease, an app with no deployment, running a service by hand), 413 payload too large, 500 store failure.
+* `/v1/*` needs credentials, one of: `Authorization: Bearer $ORBIT_CLOUD_TOKEN` (the break-glass admin token),
+  `Authorization: Bearer oc_...` (an API token), or the session cookie of a signed-in user (mutating requests then also
+  need `X-CSRF-Token`). The log stream also accepts `?token=...`. Details: [platform.md](platform.md#2-authentication-and-authorisation)
+  and [Platform](#platform) below. A node with no `ORBIT_CLOUD_TOKEN` and no user yet is open (development).
+* `/healthz`, `/metrics`, `/` (the console), `/setup` and the `POST /v1/setup` and `POST /v1/auth/login` calls are open.
+* **Projects.** Every app resource lives in a project. `/v1/apps/...`, `/v1/runs/...`, `/v1/logs...` and `/v1/queues/...`
+  act on the `default` project, or on the project named by `?project=NAME`; the same paths below `/v1/projects/{p}/`
+  (`/v1/projects/{p}/apps/{app}/runs`, ...) are the explicit form. App names are unique per project. In responses,
+  `name` is the name inside the project; the `app` field of runs and log lines is the app key (`name` in the
+  `default` project, `project.name` elsewhere), and queue names are scoped by project the same way.
+* Errors are `{"error": "message"}` with the status: 400 bad input, 401 auth, 403 not allowed, 404 not found (also for
+  projects you have no role in), 409 conflict (a stale lease, an app with no deployment, running a service by hand), 413
+  payload too large, 429 too many failed logins (with `Retry-After`), 500 store failure.
 * Times are Unix milliseconds, except span times, which are microseconds.
 * Names of apps and queues: 1 to 63 of `a-z`, `0-9`, `-`, not starting with `-`.
 
@@ -35,6 +43,7 @@ rejected. Capabilities are off unless named (see [architecture.md](architecture.
 | `restart` | `"always"`, `"on-failure"`, `"never"` | `"always"` | restart policy of a service |
 | `queue` | string | none | the queue of a consumer (required for `consumer`, refused otherwise) |
 | `max_attempts` | integer 1..100 | `5` | deliveries before a message is dead-lettered (consumer) |
+| `http` | bool | `false` | a service that speaks HTTP: orbitd assigns a loopback port (env `PORT`, `listen` grant `127.0.0.1:PORT`) and the project's routes proxy to it; the first one gets the route `/` |
 
 ```json
 { "kind": "consumer", "queue": "orders", "max_attempts": 3, "kv_namespaces": ["seen"],
@@ -226,6 +235,67 @@ scrape_configs:
   - job_name: orbit-cloud
     static_configs: [{ targets: ["orbitd:8080"] }]
 ```
+
+## Platform
+
+New in the multi-tenant layer; the model and the permission rules are in [platform.md](platform.md). Roles are
+`viewer < developer < admin < owner`. Request bodies are JSON.
+
+### Setup and sessions
+
+| Call | Meaning |
+|---|---|
+| `GET /setup` | the built-in form for the first owner (open) |
+| `POST /v1/setup` `{token, email, display_name, password}` | first boot only: `token` is the one `orbitd` logged (or the admin token as a Bearer header). 201 with the `/v1/me` body and a session cookie; 409 once a user exists; 403 for a wrong token; rate limited |
+| `POST /v1/auth/login` `{email, password}` | 200 `{user, memberships, csrf_token}` and `Set-Cookie: orbit_session=...` (`__Host-orbit_session` with `Secure` over HTTPS; always `HttpOnly; SameSite=Lax; Path=/`). 401 for a bad login (the same answer for unknown emails), 429 after 5 failures per 15 minutes per address or email |
+| `POST /v1/auth/logout` | ends the session, clears the cookie (204) |
+| `GET /v1/me` | the signed-in user, their memberships and the CSRF token to send as `X-CSRF-Token`; for a token or the admin token a short description of it |
+
+Cookie-authenticated `POST`/`PUT`/`PATCH`/`DELETE` need the header `X-CSRF-Token` from login or `/v1/me`; a request with an
+`Origin` that is not the `Host` is refused (403).
+
+### Users, organisations, members
+
+| Call | Needs | Meaning |
+|---|---|---|
+| `GET /v1/users`, `POST /v1/users` `{email, password, display_name?, org?, role?, is_admin?}` | instance admin | list / create a user (optionally a member of `org`) |
+| `GET /v1/orgs`, `POST /v1/orgs` `{name}` | any / instance admin | the organisations you see with your role / create one (you become its owner) |
+| `GET /v1/orgs/{o}`, `DELETE /v1/orgs/{o}` | viewer / owner | the org with its projects; delete an org without projects |
+| `GET /v1/orgs/{o}/members` | viewer | `[{user_id, email, display_name, role}]` |
+| `POST /v1/orgs/{o}/members` `{email, role}` | admin (owner for `owner`) | add an existing user or change their role |
+| `PATCH /v1/orgs/{o}/members/{user_id}` `{role}`, `DELETE ...` | admin (owner for owners) | change / remove; the last owner stays (409) |
+| `GET /v1/orgs/{o}/audit?before=ID&limit=100&project=NAME` | admin | the org's audit log, newest first |
+| `GET /v1/audit` | instance admin | the whole audit log |
+
+### Projects
+
+| Call | Needs | Meaning |
+|---|---|---|
+| `GET /v1/projects` | any | the projects you can see: `[{name, org, host, created_at}]` (`host` is `<name>.<base domain>` when the gateway is on) |
+| `POST /v1/projects` `{org?, name}` | admin of the org | create; `name` is `[a-z0-9-]{1,63}`, unique on the node, not `console`, `www`, `api`, `acme`, `admin`, `localhost` (409) |
+| `GET /v1/projects/{p}` | viewer | the project, your role, its app count |
+| `DELETE /v1/projects/{p}?force=true` | owner | without `force`, 409 while apps exist; `force` deletes them with their data |
+
+### Domains and routes
+
+| Call | Needs | Meaning |
+|---|---|---|
+| `POST /v1/projects/{p}/domains` `{host}` | admin | claim a custom domain. 201 with `{host, status: "pending", txt: {name, value}, cname: {name, value}, cname_ok, last_checked, last_error}`: create the TXT record (`_orbit-verify.<host>`) and a CNAME to `cname.value` |
+| `GET /v1/projects/{p}/domains`, `GET .../domains/{host}` | viewer | status (`pending`, `verified`) and the last DNS check |
+| `POST /v1/projects/{p}/domains/{host}/verify` | admin | check DNS now |
+| `DELETE /v1/projects/{p}/domains/{host}` | admin | remove the domain, its routes and its certificate |
+| `GET /v1/projects/{p}/routes`, `POST ...` `{path_prefix, app, host?}`, `DELETE .../routes/{id}` | viewer / developer | host + path prefix to an HTTP service of the project |
+
+`cname_ok` says whether the host currently resolves to the same addresses as the project host. Only the TXT record
+decides verification.
+
+### API tokens
+
+| Call | Meaning |
+|---|---|
+| `POST /v1/tokens` `{name, scope: {"project": "shop"} or {"org": "acme"}, role, expires_in_days?}` | 201 with the record and `token` (`oc_...`, shown once). The role cannot exceed yours; API tokens cannot create tokens |
+| `GET /v1/tokens` | your tokens (everyone's for an instance admin or the admin token; an API token sees itself); never the secret |
+| `DELETE /v1/tokens/{id}` | revoke (your own, or any as instance admin) |
 
 ## Console
 

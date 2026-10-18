@@ -9,7 +9,7 @@ A minimal Debian (trixie) disk image, built with [mkosi](https://github.com/syst
 | Partitions | ESP (256 MiB), root (ext4, **read-only**), `orbit-data` (ext4, the rest of the disk) |
 | Data | `orbit-data` is mounted at `/var/lib/orbit-cloud` (`nodev,nosuid,noexec`); the database and app files live there |
 | Service | `orbitd.service`: user `orbitd`, sandboxed like `deploy/systemd/orbitd.service`, listens on 8080 |
-| Admin token | the systemd credential `orbit-cloud.token`; without it `orbitd` refuses to start (the API must not be open) |
+| Admin token | the systemd credential `orbit-cloud.token` (the break-glass token); without it `orbitd` refuses to start (the API must not be open) |
 | Updates | replace the image (A/B partitions are planned for milestone 2); the data partition survives if you keep the disk |
 
 ## Build
@@ -62,6 +62,15 @@ occtl deploy hello hello.wasm && occtl run hello
 Quit QEMU with `Ctrl-a x`. To get a recovery shell, put `RootPassword=...` in `deploy/os/mkosi.local.conf` (git-ignored)
 and rebuild. On a cloud provider or bare metal, pass the credential the way the platform supports systemd credentials
 (a `.cred` file on the ESP, SMBIOS OEM strings, or `systemd.set_credential=` on the kernel command line for tests).
+
+## Gateway (optional)
+
+Pass the credentials `orbit-cloud.base-domain` (for example `cloud.example.com`) and, for Let's Encrypt certificates,
+`orbit-cloud.acme-email`; `orbitd-start` then turns on the platform gateway on ports 80 and 443 and moves the direct API
+port to loopback. A sysctl file lets the unprivileged `orbitd` user bind those ports. Point `cloud.example.com` and
+`*.cloud.example.com` at the machine. The admin credential `orbit-cloud.token` stays required: it is the break-glass
+token; users are created at the setup URL in the journal (`journalctl -u orbitd`). This part is not built or booted in
+CI either.
 
 ## Status
 
