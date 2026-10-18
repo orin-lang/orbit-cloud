@@ -73,6 +73,8 @@ pub struct Spec {
     pub env: BTreeMap<String, String>,
     /// KV namespaces of `orbit:kv/v1` the app may use; empty = no KV.
     pub kv_namespaces: Vec<String>,
+    /// Queues the app may publish to with `orbit:queue/v1` (deny by default); a consumer's own `queue` is separate.
+    pub publish: Vec<String>,
     /// `ADDR:PORT` or `ADDR:LO-HI` the app may listen on (`orbit:net/v1`).
     pub listen: Vec<String>,
     /// `HOST:PORT` patterns the app may connect to and resolve (`orbit:net/v1`).
@@ -108,6 +110,11 @@ impl Spec {
         for ns in &self.kv_namespaces {
             if ns.is_empty() || ns.len() > 64 {
                 return Err(format!("bad kv namespace `{ns}`"));
+            }
+        }
+        for q in &self.publish {
+            if !oc_store::valid_name(q) {
+                return Err(format!("bad publish queue name `{q}`"));
             }
         }
         if self.env.keys().any(|k| k.is_empty() || k.contains('=')) {
@@ -167,6 +174,12 @@ impl Spec {
             g = g.grant_with(
                 CapabilityId::kv_v1(),
                 serde_json::json!({ "namespaces": self.kv_namespaces }),
+            );
+        }
+        if !self.publish.is_empty() {
+            g = g.grant_with(
+                CapabilityId::queue_v1(),
+                serde_json::json!({ "publish": self.publish }),
             );
         }
         if !self.listen.is_empty() || !self.connect.is_empty() {
@@ -232,12 +245,27 @@ mod tests {
     }
 
     #[test]
+    fn publish_grant_and_validation() {
+        let s: Spec = serde_json::from_value(serde_json::json!({"publish": ["orders"]})).unwrap();
+        s.validate().unwrap();
+        let g = s.grants("app", None, None).unwrap();
+        assert_eq!(
+            g.config(&CapabilityId::queue_v1()).unwrap()["publish"],
+            serde_json::json!(["orders"])
+        );
+        let bad: Spec =
+            serde_json::from_value(serde_json::json!({"publish": ["Bad Name"]})).unwrap();
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
     fn grants_are_deny_by_default() {
         let s = Spec::default();
         let g = s.grants("app", None, None).unwrap();
         assert!(g.contains(&CapabilityId::log_v1()));
         assert!(!g.contains(&CapabilityId::kv_v1()));
         assert!(!g.contains(&CapabilityId::net_v1()));
+        assert!(!g.contains(&CapabilityId::queue_v1()));
         assert!(!g.contains(&CapabilityId::fs_v1()));
         let s = Spec {
             clock: Some(false),

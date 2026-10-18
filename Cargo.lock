@@ -1271,7 +1271,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "orbit-abi"
 version = "0.1.0"
-source = "git+https://github.com/orin-lang/orbit?rev=94fd1a093a521f85a07a3b471d78df9f87d984bc#94fd1a093a521f85a07a3b471d78df9f87d984bc"
+source = "git+https://github.com/orin-lang/orbit?rev=92100fd0de4bad8f2befaeea7ab4ea430590b57f#92100fd0de4bad8f2befaeea7ab4ea430590b57f"
 dependencies = [
  "serde",
  "serde_json",
@@ -1281,7 +1281,7 @@ dependencies = [
 [[package]]
 name = "orbit-caps"
 version = "0.1.0"
-source = "git+https://github.com/orin-lang/orbit?rev=94fd1a093a521f85a07a3b471d78df9f87d984bc#94fd1a093a521f85a07a3b471d78df9f87d984bc"
+source = "git+https://github.com/orin-lang/orbit?rev=92100fd0de4bad8f2befaeea7ab4ea430590b57f#92100fd0de4bad8f2befaeea7ab4ea430590b57f"
 dependencies = [
  "cap-std",
  "getrandom 0.3.4",
@@ -1296,7 +1296,7 @@ dependencies = [
 [[package]]
 name = "orbit-runtime"
 version = "0.1.0"
-source = "git+https://github.com/orin-lang/orbit?rev=94fd1a093a521f85a07a3b471d78df9f87d984bc#94fd1a093a521f85a07a3b471d78df9f87d984bc"
+source = "git+https://github.com/orin-lang/orbit?rev=92100fd0de4bad8f2befaeea7ab4ea430590b57f#92100fd0de4bad8f2befaeea7ab4ea430590b57f"
 dependencies = [
  "orbit-abi",
  "serde_json",

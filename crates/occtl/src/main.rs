@@ -48,6 +48,9 @@ enum Cmd {
         /// KV namespace the app may use (repeatable).
         #[arg(long = "kv")]
         kv: Vec<String>,
+        /// Queue the app may publish to (repeatable).
+        #[arg(long = "publish")]
+        publish: Vec<String>,
         /// ADDR:PORT the app may listen on (repeatable).
         #[arg(long)]
         listen: Vec<String>,
@@ -330,6 +333,7 @@ fn run() -> Result<()> {
             kind,
             queue,
             kv,
+            publish,
             listen,
             connect,
             env,
@@ -356,6 +360,9 @@ fn run() -> Result<()> {
             }
             if !kv.is_empty() {
                 o.insert("kv_namespaces".into(), json!(kv));
+            }
+            if !publish.is_empty() {
+                o.insert("publish".into(), json!(publish));
             }
             if !listen.is_empty() {
                 o.insert("listen".into(), json!(listen));

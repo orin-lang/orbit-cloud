@@ -506,7 +506,7 @@ async fn kv_delete(
 // ------------------------------------------------------------------------------------------------ queues
 
 async fn list_queues(State(s): State<AppState>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!(s.node.executor.store().queues()?)))
+    Ok(Json(json!(s.node.executor.queues().stats()?)))
 }
 
 async fn enqueue(
@@ -520,7 +520,7 @@ async fn enqueue(
             "message over 1 MiB".into(),
         ));
     }
-    let id = s.node.executor.store().enqueue(&q, &body)?;
+    let id = s.node.executor.queues().publish(&q, &body)?;
     s.node.queue_signal.notify_waiters();
     Ok((StatusCode::CREATED, Json(json!({ "id": id, "queue": q }))))
 }
@@ -546,7 +546,7 @@ async fn lease(
     match s
         .node
         .executor
-        .store()
+        .queues()
         .lease(&q, p.lease_ms.unwrap_or(30_000).clamp(1, 3_600_000))?
     {
         Some(m) => Ok(Json(message_json(&m)).into_response()),
@@ -567,7 +567,7 @@ async fn ack(
     Path((_q, id)): Path<(String, i64)>,
     Json(b): Json<AckBody>,
 ) -> ApiResult<StatusCode> {
-    s.node.executor.store().ack(id, &b.token)?;
+    s.node.executor.queues().ack(id, &b.token)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -576,7 +576,7 @@ async fn nack(
     Path((_q, id)): Path<(String, i64)>,
     Json(b): Json<AckBody>,
 ) -> ApiResult<Json<Value>> {
-    let o = s.node.executor.store().nack(
+    let o = s.node.executor.queues().nack(
         id,
         &b.token,
         b.error.as_deref().unwrap_or("rejected"),
@@ -594,7 +594,7 @@ async fn dead_letters(
     let dead = s
         .node
         .executor
-        .store()
+        .queues()
         .dead_letters(&q, l.limit.unwrap_or(100))?;
     Ok(Json(json!(
         dead.iter().map(message_json).collect::<Vec<_>>()
@@ -602,7 +602,7 @@ async fn dead_letters(
 }
 
 async fn redrive(State(s): State<AppState>, Path(q): Path<String>) -> ApiResult<Json<Value>> {
-    let n = s.node.executor.store().redrive(&q)?;
+    let n = s.node.executor.queues().redrive(&q)?;
     s.node.queue_signal.notify_waiters();
     Ok(Json(json!({ "redriven": n })))
 }

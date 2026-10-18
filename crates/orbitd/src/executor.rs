@@ -11,12 +11,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use oc_store::{Deployment, NewLog, Run, RunOutcome, Span, Store, random_id};
 use orbit_caps::{
     ClockCapability, FsCapability, KvCapability, KvError, KvStore, LogCapability, LogRecord,
-    LogSink, NetCapability, ProcessCapability, RandomCapability, StdinError, StdinProvider,
-    StdinReader, WasiCapability,
+    LogSink, NetCapability, ProcessCapability, QueueCapability, RandomCapability, StdinError,
+    StdinProvider, StdinReader, WasiCapability,
 };
 use orbit_runtime::{CapabilityRegistry, ExecError, InstanceInfo, Isolate, Runtime, RuntimeConfig};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::queues::{GuestQueues, MessageQueue};
 use crate::spec::Spec;
 
 /// Key in the `process/v1` grant config that names the stdin bytes of a run (ignored by Orbit, read by [`RunStdin`]).
@@ -195,6 +196,8 @@ pub struct Executor {
     runs: Arc<RunIndex>,
     stdin: RunStdin,
     files_root: PathBuf,
+    queues: Arc<dyn MessageQueue>,
+    queue_signal: Arc<tokio::sync::Notify>,
     log_tx: mpsc::UnboundedSender<LogMsg>,
     /// Metrics.
     pub counters: Arc<Counters>,
@@ -252,6 +255,21 @@ impl Executor {
         data_dir: &std::path::Path,
         fuel_metering: bool,
     ) -> anyhow::Result<Self> {
+        let queues: Arc<dyn MessageQueue> = Arc::clone(&store) as Arc<dyn MessageQueue>;
+        Self::with_queues(store, data_dir, fuel_metering, queues)
+    }
+
+    /// Like [`new`](Self::new) with another queue backend (the default is the store itself).
+    ///
+    /// # Errors
+    /// When the Orbit engine cannot be created.
+    pub fn with_queues(
+        store: Arc<Store>,
+        data_dir: &std::path::Path,
+        fuel_metering: bool,
+        queues: Arc<dyn MessageQueue>,
+    ) -> anyhow::Result<Self> {
+        let queue_signal = Arc::new(tokio::sync::Notify::new());
         let counters = Arc::new(Counters::default());
         let runs = Arc::new(RunIndex::default());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -270,6 +288,10 @@ impl Executor {
             .with(RandomCapability::new())
             .with(NetCapability::new())
             .with(KvCapability::new(StoreKv(Arc::clone(&store))))
+            .with(QueueCapability::new(GuestQueues::new(
+                Arc::clone(&queues),
+                Arc::clone(&queue_signal),
+            )))
             .with(wasi)
             .with(FsCapability::new())
             .with(ProcessCapability::new().with_stdin(stdin.clone()));
@@ -283,9 +305,23 @@ impl Executor {
             runs,
             stdin,
             files_root,
+            queues,
+            queue_signal,
             log_tx: tx,
             counters,
         })
+    }
+
+    /// The queue backend (consumers, the queue API and `orbit:queue/v1` all go through it).
+    #[must_use]
+    pub fn queues(&self) -> &Arc<dyn MessageQueue> {
+        &self.queues
+    }
+
+    /// Woken after every publish so idle consumers poll at once.
+    #[must_use]
+    pub fn queue_signal(&self) -> &Arc<tokio::sync::Notify> {
+        &self.queue_signal
     }
 
     /// The store.

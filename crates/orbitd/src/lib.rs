@@ -5,4 +5,5 @@ pub mod api;
 pub mod executor;
 pub mod metrics;
 pub mod node;
+pub mod queues;
 pub mod spec;

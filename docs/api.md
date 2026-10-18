@@ -25,6 +25,7 @@ rejected. Capabilities are off unless named (see [architecture.md](architecture.
 | `args` | string[] | `[]` | program arguments after `argv[0]` (the app name) |
 | `env` | map string to string | `{}` | environment of the run; names non-empty, no `=` |
 | `kv_namespaces` | string[] | `[]` | namespaces of `orbit:kv/v1` the app may use |
+| `publish` | string[] | `[]` | queues the app may publish to with `orbit:queue/v1` (`publish`, `publish_batch`); deny by default |
 | `listen` | string[] | `[]` | `ADDR:PORT` or `ADDR:LO-HI` the app may listen on |
 | `connect` | string[] | `[]` | `HOST:PORT` patterns the app may connect to and resolve |
 | `files` | bool | `false` | a persistent read-write directory mounted at `/data` |

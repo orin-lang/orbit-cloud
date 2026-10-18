@@ -117,6 +117,7 @@ Everything else needs a field in the spec:
 | Capability | Granted by | Scope |
 |---|---|---|
 | `orbit:kv/v1` | `kv_namespaces` | only the named namespaces |
+| `orbit:queue/v1` | `publish` | publish only to the named queues (receiving is the consumer app kind); queue names are node-wide |
 | `orbit:net/v1` | `listen`, `connect` | only `ADDR:PORT`/`ADDR:LO-HI` to listen on and `HOST:PORT` patterns to connect to or resolve |
 | `orbit:fs/v1` | `files: true` | one read-write directory, `files/<app>/` of the data dir, mounted at `/data`; nothing else of the host |
 | `orbit:process/v1`, `wasi` | always | `argv[0]` is the app name, then `args`; `env` is exactly the spec's `env`; stdin is the run's input. No host environment, no spawning. |
@@ -158,3 +159,12 @@ inner boundary; the sandbox is the outer one.
 Not yet: retention (logs, runs, spans and dead letters grow until the app is deleted; milestone 2), multiple nodes,
 users and scopes, TLS, schedules, secrets, OpenTelemetry export. SQLite serialises all writers behind one connection;
 that is ample for one node, and a reason the cluster design (milestone 4) moves the control plane elsewhere.
+
+### Queue backends
+
+Queue logic sits behind the `MessageQueue` trait (`orbitd::queues`): publish, lease/ack/nack, stats, dead letters and
+redrive. The built-in backend is the SQLite store, so queues survive restarts and need nothing else. The API, the
+consumer workers and the guests' `orbit:queue/v1` (`GuestQueues`) only use the trait, and
+`Executor::with_queues` takes another implementation. NATS JetStream is a planned optional backend (not implemented):
+it would implement the same trait, with `lease` as a pull-consumer fetch, `ack`/`nack` as ack/nak with delay, and the
+dead letters as a stream the max-deliveries advisory feeds.

@@ -12,9 +12,10 @@ publish = false
 [workspace.dependencies]
 oc-store = { path = "crates/oc-store" }
 # Orbit, pinned to a commit of orin-lang/orbit main (bump deliberately: the host ABI is versioned per capability).
-orbit-abi = { git = "https://github.com/orin-lang/orbit", rev = "94fd1a093a521f85a07a3b471d78df9f87d984bc" }
-orbit-runtime = { git = "https://github.com/orin-lang/orbit", rev = "94fd1a093a521f85a07a3b471d78df9f87d984bc" }
-orbit-caps = { git = "https://github.com/orin-lang/orbit", rev = "94fd1a093a521f85a07a3b471d78df9f87d984bc" }
+# NOTE: rev is the head of orin-lang/orbit PR #6 (orbit:queue/v1); bump to the merged main commit before merging.
+orbit-abi = { git = "https://github.com/orin-lang/orbit", rev = "92100fd0de4bad8f2befaeea7ab4ea430590b57f" }
+orbit-runtime = { git = "https://github.com/orin-lang/orbit", rev = "92100fd0de4bad8f2befaeea7ab4ea430590b57f" }
+orbit-caps = { git = "https://github.com/orin-lang/orbit", rev = "92100fd0de4bad8f2befaeea7ab4ea430590b57f" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
 axum = "0.8"

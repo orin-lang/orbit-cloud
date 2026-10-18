@@ -962,6 +962,33 @@ impl Store {
         Ok(db.last_insert_rowid())
     }
 
+    /// Enqueues several messages in order in one transaction; returns the id of the first.
+    ///
+    /// # Errors
+    /// [`StoreError::Conflict`] for a bad queue name or an empty batch.
+    pub fn enqueue_batch(&self, queue: &str, bodies: &[Vec<u8>]) -> Result<i64> {
+        if !valid_name(queue) || bodies.is_empty() {
+            return Err(StoreError::Conflict(format!(
+                "invalid queue name `{queue}` or empty batch"
+            )));
+        }
+        let now = now_ms();
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let mut first = 0;
+        for (i, body) in bodies.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO queue_messages (queue, body, state, visible_at, enqueued_at) VALUES (?1, ?2, 'ready', ?3, ?3)",
+                params![queue, body, now],
+            )?;
+            if i == 0 {
+                first = tx.last_insert_rowid();
+            }
+        }
+        tx.commit()?;
+        Ok(first)
+    }
+
     /// Leases the oldest deliverable message of `queue` for `lease_ms`, or `None` when there is none.
     ///
     /// # Errors

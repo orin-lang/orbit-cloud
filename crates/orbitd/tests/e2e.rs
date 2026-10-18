@@ -144,6 +144,20 @@ const CONSUMER: &str = r#"(module
     (if (i32.eq (i32.load (i32.const 100)) (i32.const 0x6c696166)) ;; "fail"
       (then unreachable))))"#;
 
+/// Publishes "hello" to queue `jobs` and logs the status code digit ('0' = OK, otherwise '-').
+const PUBLISHER: &str = r#"(module
+  (import "orbit:queue/v1" "publish" (func $pub (param i64 i64 i64 i64) (result i32)))
+  (import "orbit:log/v1" "write" (func $log (param i32 i64 i64) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 0) "jobs")
+  (data (i32.const 8) "hello")
+  (data (i32.const 32) "0-")
+  (func (export "_start") (local $st i32)
+    (local.set $st (call $pub (i64.const 0) (i64.const 4) (i64.const 8) (i64.const 5)))
+    (drop (call $log (i32.const 2)
+      (select (i64.const 32) (i64.const 33) (i32.eqz (local.get $st))) (i64.const 1)))
+    (if (local.get $st) (then unreachable))))"#;
+
 /// An Orin-style program whose `orin_main` returns exit status 3.
 const EXIT3: &str = r#"(module
   (memory (export "memory") 1)
@@ -302,6 +316,44 @@ async fn kv_persists_across_runs_and_is_denied_without_grant() {
     assert_eq!(s, StatusCode::OK);
     let (_, run) = json_call(&f.app, "POST", "/v1/apps/counter/runs", vec![]).await;
     assert_eq!(run["status"], "succeeded");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn app_publishes_to_a_queue_a_consumer_reads_and_is_denied_without_grant() {
+    let f = fx().await;
+    deploy(
+        &f.app,
+        "worker",
+        CONSUMER,
+        json!({ "kind": "consumer", "queue": "jobs" }),
+    )
+    .await;
+    deploy(&f.app, "pub", PUBLISHER, json!({ "publish": ["jobs"] })).await;
+    let (_, run) = json_call(&f.app, "POST", "/v1/apps/pub/runs", vec![]).await;
+    assert_eq!(run["status"], "succeeded", "{run}");
+    let mut done = false;
+    for _ in 0..200 {
+        let (_, q) = json_call(&f.app, "GET", "/v1/queues", vec![]).await;
+        if q[0]["done"] == 1 {
+            done = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(done, "the consumer did not receive the published message");
+    let (_, runs) = json_call(&f.app, "GET", "/v1/apps/worker/runs", vec![]).await;
+    let id = runs[0]["id"].as_str().unwrap();
+    assert_eq!(logs_of(&f.app, id, 1).await, ["hello"]);
+    // Publishing to a queue outside the grant is refused (the guest traps on a non-zero status).
+    deploy(&f.app, "pub", PUBLISHER, json!({ "publish": ["other"] })).await;
+    let (_, run) = json_call(&f.app, "POST", "/v1/apps/pub/runs", vec![]).await;
+    assert_eq!(run["status"], "failed", "{run}");
+    // Without the capability the import does not link.
+    deploy(&f.app, "pub", PUBLISHER, json!({})).await;
+    let (_, run) = json_call(&f.app, "POST", "/v1/apps/pub/runs", vec![]).await;
+    assert_eq!(run["status"], "failed", "{run}");
+    let (_, q) = json_call(&f.app, "GET", "/v1/queues", vec![]).await;
+    assert_eq!(q.as_array().unwrap().len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
