@@ -358,7 +358,8 @@ struct StatsParams {
 
 /// `GET /v1/stats`: run counts by status, run-time percentiles and log counts per time bucket.
 async fn stats(State(s): State<AppState>, Query(p): Query<StatsParams>) -> ApiResult<Json<Value>> {
-    let until = p.until.unwrap_or_else(oc_store::now_ms);
+    // `until` is exclusive; the default includes runs started in the current millisecond.
+    let until = p.until.unwrap_or_else(|| oc_store::now_ms() + 1);
     let bucket = p.bucket.unwrap_or(3_600_000);
     let since = p.since.unwrap_or(until - 24 * 3_600_000);
     if until <= since || bucket < 1000 || (until - since + bucket - 1) / bucket > 1000 {
