@@ -26,6 +26,32 @@ struct Args {
     /// Meter fuel so runs report it and `limits.fuel` works (costs some speed).
     #[arg(long, env = "ORBIT_CLOUD_FUEL_METERING")]
     fuel_metering: bool,
+    /// Probe `/healthz` on the listen address and exit 0 if the node answers (for container health checks).
+    #[arg(long)]
+    healthcheck: bool,
+}
+
+/// GET `/healthz` over plain TCP; true on a 200. An unspecified listen address is probed on loopback.
+fn healthcheck(listen: SocketAddr) -> bool {
+    use std::io::{Read as _, Write as _};
+    let mut addr = listen;
+    if addr.ip().is_unspecified() {
+        addr.set_ip(if addr.is_ipv4() {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        });
+    }
+    let t = std::time::Duration::from_secs(3);
+    let Ok(mut c) = std::net::TcpStream::connect_timeout(&addr, t) else {
+        return false;
+    };
+    let _ = c.set_read_timeout(Some(t));
+    let req = format!("GET /healthz HTTP/1.0\r\nHost: {addr}\r\n\r\n");
+    let mut head = [0u8; 12];
+    c.write_all(req.as_bytes()).is_ok()
+        && c.read_exact(&mut head).is_ok()
+        && (head.starts_with(b"HTTP/1.1 200") || head.starts_with(b"HTTP/1.0 200"))
 }
 
 #[tokio::main]
@@ -36,6 +62,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
     let args = Args::parse();
+    if args.healthcheck {
+        std::process::exit(i32::from(!healthcheck(args.listen)));
+    }
     std::fs::create_dir_all(&args.data_dir)
         .with_context(|| format!("cannot create {}", args.data_dir.display()))?;
     let store = Arc::new(
@@ -96,5 +125,40 @@ async fn shutdown() {
     tokio::select! {
         () = ctrl_c => {}
         () = term => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read as _, Write as _};
+
+    use super::healthcheck;
+
+    fn serve_once(reply: &'static [u8]) -> std::net::SocketAddr {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = l.accept() {
+                let mut buf = [0u8; 256];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(reply);
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn healthcheck_needs_a_200() {
+        assert!(healthcheck(serve_once(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok"
+        )));
+        assert!(!healthcheck(serve_once(
+            b"HTTP/1.1 503 Service Unavailable\r\n\r\n"
+        )));
+        let closed = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        assert!(!healthcheck(closed));
     }
 }

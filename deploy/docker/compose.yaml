@@ -1,0 +1,31 @@
+# docker compose -f deploy/docker/compose.yaml up --build
+# The admin token is required:  ORBIT_CLOUD_TOKEN=... docker compose -f deploy/docker/compose.yaml up
+name: orbit-cloud
+
+services:
+  orbitd:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    image: orbit-cloud:local
+    restart: unless-stopped
+    environment:
+      ORBIT_CLOUD_TOKEN: ${ORBIT_CLOUD_TOKEN:?set ORBIT_CLOUD_TOKEN to the admin token}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      # API, console and metrics. Bind to loopback and put a TLS reverse proxy in front for anything but local use.
+      - "127.0.0.1:8080:8080"
+      # Publish the ports that service apps listen on (their spec's `listen`), for example:
+      # - "9000:9000"
+    volumes:
+      - orbit-data:/var/lib/orbit-cloud
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+
+volumes:
+  orbit-data:

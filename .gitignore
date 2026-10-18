@@ -3,3 +3,7 @@ target/
 *.db-wal
 *.db-shm
 /data/
+/deploy/os/mkosi.extra/usr/bin/
+/deploy/os/mkosi.output/
+/deploy/os/mkosi.cache/
+/deploy/os/mkosi.local.conf

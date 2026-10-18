@@ -1,0 +1,2 @@
+# The root file system is found by the GPT partition types (systemd-gpt-auto-generator).
+PARTLABEL=orbit-data  /var/lib/orbit-cloud  ext4  defaults,nodev,nosuid,noexec,x-systemd.growfs  0  2

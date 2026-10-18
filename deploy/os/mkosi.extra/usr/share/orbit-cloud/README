@@ -1,0 +1,4 @@
+Orbit Cloud appliance. orbitd listens on port 8080 (API, console, /metrics, /healthz).
+The admin token is a systemd credential named orbit-cloud.token, for example
+  qemu ... -smbios type=11,value=io.systemd.credential:orbit-cloud.token=SECRET
+Data lives on the partition labelled orbit-data, mounted at /var/lib/orbit-cloud. The root file system is read-only.
