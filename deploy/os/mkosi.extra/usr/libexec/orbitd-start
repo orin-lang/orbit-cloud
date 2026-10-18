@@ -9,4 +9,13 @@ if [ ! -s "$tok" ]; then
 fi
 ORBIT_CLOUD_TOKEN=$(cat "$tok")
 export ORBIT_CLOUD_TOKEN
+# Optional platform gateway: a base domain turns on <project>.<base> routing, custom domains and HTTPS on 80/443.
+# Credentials: orbit-cloud.base-domain, orbit-cloud.acme-email (Let's Encrypt contact; without it only the operator's
+# certificate files or stored certificates are served). The direct API port then listens on loopback only.
+cred() { f="${CREDENTIALS_DIRECTORY:-/nonexistent}/$1"; [ -s "$f" ] && tr -d '\n' < "$f"; }
+if base=$(cred orbit-cloud.base-domain); then
+    export ORBIT_CLOUD_BASE_DOMAIN="$base"
+    export ORBIT_CLOUD_LISTEN="127.0.0.1:8080"
+    if email=$(cred orbit-cloud.acme-email); then export ORBIT_CLOUD_ACME_EMAIL="$email"; fi
+fi
 exec /usr/bin/orbitd "$@"

@@ -1,5 +1,9 @@
 # docker compose -f deploy/docker/compose.yaml up --build
-# The admin token is required:  ORBIT_CLOUD_TOKEN=... docker compose -f deploy/docker/compose.yaml up
+# ORBIT_CLOUD_TOKEN is the break-glass admin token; the first owner is created at the setup URL printed in the log:
+#   ORBIT_CLOUD_TOKEN=... docker compose -f deploy/docker/compose.yaml up
+# For the public gateway (projects at <project>.<base>, custom domains, HTTPS) set
+#   ORBIT_CLOUD_BASE_DOMAIN=cloud.example.com ORBIT_CLOUD_ACME_EMAIL=you@example.com
+# and point *.cloud.example.com (and cloud.example.com) at this host. Ports 80 and 443 must reach the container.
 name: orbit-cloud
 
 services:
@@ -10,10 +14,18 @@ services:
     image: orbit-cloud:local
     restart: unless-stopped
     environment:
-      ORBIT_CLOUD_TOKEN: ${ORBIT_CLOUD_TOKEN:?set ORBIT_CLOUD_TOKEN to the admin token}
+      ORBIT_CLOUD_TOKEN: ${ORBIT_CLOUD_TOKEN:?set ORBIT_CLOUD_TOKEN to the break-glass admin token}
+      ORBIT_CLOUD_BASE_DOMAIN: ${ORBIT_CLOUD_BASE_DOMAIN:-}
+      ORBIT_CLOUD_ACME_EMAIL: ${ORBIT_CLOUD_ACME_EMAIL:-}
+      # With a base domain the gateway listens on 80 and 443 (inside the container too).
       RUST_LOG: ${RUST_LOG:-info}
+    sysctls:
+      # lets the unprivileged user bind 80 and 443 without any capability
+      net.ipv4.ip_unprivileged_port_start: 0
     ports:
-      # API, console and metrics. Bind to loopback and put a TLS reverse proxy in front for anything but local use.
+      - "80:80"
+      - "443:443"
+      # Direct API, console and metrics (no gateway, no TLS). Bind to loopback; use the gateway for anything public.
       - "127.0.0.1:8080:8080"
       # Publish the ports that service apps listen on (their spec's `listen`), for example:
       # - "9000:9000"

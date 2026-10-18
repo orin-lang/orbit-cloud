@@ -147,11 +147,21 @@ async fn main() -> anyhow::Result<()> {
         .as_deref()
         .map(|b| b.trim().trim_end_matches('.').to_lowercase())
         .filter(|b| !b.is_empty());
-    let gateway_wanted = args.http.is_some() || args.https.is_some();
+    // A base domain alone means "run the gateway": HTTP on 80 and, unless TLS is off, HTTPS on 443.
+    let (http, https) = if base_domain.is_some() && args.http.is_none() && args.https.is_none() {
+        (
+            Some(SocketAddr::from(([0, 0, 0, 0], 80))),
+            (args.tls == TlsMode::Auto).then(|| SocketAddr::from(([0, 0, 0, 0], 443))),
+        )
+    } else {
+        (args.http, args.https)
+    };
+    let acme_email = args.acme_email.clone().filter(|e| !e.trim().is_empty());
+    let gateway_wanted = http.is_some() || https.is_some();
     if gateway_wanted && base_domain.is_none() {
         anyhow::bail!("--http / --https need --base-domain");
     }
-    if args.https.is_some() && args.tls == TlsMode::Off {
+    if https.is_some() && args.tls == TlsMode::Off {
         anyhow::bail!(
             "--https and --tls off contradict each other; drop --https when TLS ends at a proxy"
         );
@@ -171,11 +181,17 @@ async fn main() -> anyhow::Result<()> {
         platform: Arc::clone(&platform),
     };
     if let Some(setup) = platform.init_setup_token(&store) {
-        let https = args.https.is_some() && args.tls == TlsMode::Auto;
+        let tls = https.is_some() && args.tls == TlsMode::Auto;
+        let (scheme, port, default) = if tls {
+            ("https", https.map(|a| a.port()), 443)
+        } else {
+            ("http", http.map(|a| a.port()), 80)
+        };
+        let port = port
+            .filter(|p| *p != default)
+            .map_or_else(String::new, |p| format!(":{p}"));
         let origin = match &base_domain {
-            Some(b) if gateway_wanted => {
-                format!("{}://console.{b}", if https { "https" } else { "http" })
-            }
+            Some(b) if gateway_wanted => format!("{scheme}://console.{b}{port}"),
             _ => format!("http://{}", args.listen),
         };
         tracing::info!("no users yet. Create the first owner at {origin}/setup?token={setup}");
@@ -212,14 +228,14 @@ async fn main() -> anyhow::Result<()> {
     // the gateway
     let mut verified_rx = Some(verified_rx);
     if let (true, Some(base)) = (gateway_wanted, base_domain.clone()) {
-        let tls_on = args.https.is_some() && args.tls == TlsMode::Auto;
+        let tls_on = https.is_some() && args.tls == TlsMode::Auto;
         let (tls, challenges) = if tls_on {
             let (m, c) = build_tls(
                 &store,
                 &TlsSettings {
                     cert: args.tls_cert.clone(),
                     key: args.tls_key.clone(),
-                    acme_email: args.acme_email.clone(),
+                    acme_email: acme_email.clone(),
                     acme_directory: args.acme_directory.clone().unwrap_or_else(|| {
                         if args.acme_staging {
                             LETS_ENCRYPT_STAGING
@@ -232,7 +248,7 @@ async fn main() -> anyhow::Result<()> {
                 },
             )
             .map_err(anyhow::Error::msg)?;
-            if args.tls_cert.is_none() && args.acme_email.is_none() {
+            if args.tls_cert.is_none() && acme_email.is_none() {
                 tracing::warn!(
                     "--https without --tls-cert or --acme-email: only certificates already in the database can be served"
                 );
@@ -243,7 +259,7 @@ async fn main() -> anyhow::Result<()> {
         };
         let cfg = GatewayConfig {
             base_domain: base.clone(),
-            https_port: args.https.map(|a| a.port()),
+            https_port: https.map(|a| a.port()),
             redirect_to_https: tls_on,
             trusted: TrustedProxies::parse(&args.trusted_proxies).map_err(anyhow::Error::msg)?,
             proxy: ProxyConfig {
@@ -261,14 +277,14 @@ async fn main() -> anyhow::Result<()> {
         if let Some(rx) = verified_rx.take() {
             gw.spawn_background(rx);
         }
-        if let Some(addr) = args.http {
+        if let Some(addr) = http {
             let l = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("bind {addr}"))?;
             tracing::info!("gateway: http://{addr} (base domain {base})");
             tokio::spawn(Arc::clone(&gw).serve_http(l));
         }
-        if let Some(addr) = args.https {
+        if let Some(addr) = https {
             let l = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("bind {addr}"))?;
