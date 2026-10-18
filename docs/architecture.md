@@ -7,7 +7,7 @@ milestones are in [plan.md](plan.md); the HTTP reference is [api.md](api.md).
 ## Components
 
 ```
-            occtl / curl / browser                       Prometheus
+  browser / occtl / curl / customers' visitors             Prometheus
                      |                                       |
               +------v---------------------------------------v-----+
               |  orbitd                                            |
@@ -27,13 +27,24 @@ milestones are in [plan.md](plan.md); the HTTP reference is [api.md](api.md).
 | Store | `oc-store` | All persistence: apps, content-addressed modules, deployments, runs, logs, spans, KV, queues. One SQLite connection behind a mutex, WAL mode, foreign keys on. The only crate that knows SQL. |
 | Executor | `orbitd::executor` | Runs one deployment once. Loads the module on `orbit-runtime` (compiled artifacts are cached by content hash), builds the capability grants from the spec, spawns an isolate, calls the entry point, records the run, its spans and its log lines. |
 | Node (supervisor) | `orbitd::node` | `reconcile(app)` makes the worker of an app match its active deployment: start, replace or stop. Services get a restart loop with exponential backoff (1 s up to 60 s); consumers get a lease loop over their queue. Called at boot and after every deploy, rollback and delete. |
-| API | `orbitd::api` | The HTTP surface, bearer-token authentication, the Server-Sent-Events log stream, the console page. Handlers hold no state of their own. |
+| API | `orbitd::api` | The HTTP surface, project scoping (`/v1/projects/{p}/...` is rewritten onto the app routes with the project as request scope), the Server-Sent-Events log stream, the console page. Handlers hold no state of their own. |
+| Auth | `orbitd::auth` | Principals (break-glass token, session, API token), roles, and `Authz`, the one extractor through which every permission check goes. Passwords (argon2id), sessions, CSRF, rate limiting. |
+| Platform API | `orbitd::platform` | Setup, login, users, organisations, members, projects, domains, routes, API tokens, audit log. |
+| Gateway | `orbitd::gateway` | Public HTTP/HTTPS listeners: host routing, reverse proxy to HTTP services, TLS with certificates for known hosts only (ACME or operator files), custom-domain verification. See [platform.md](platform.md#3-the-gateway). |
 | Metrics | `orbitd::metrics` | Prometheus text exposition from process counters and store totals. |
 | Spec | `orbitd::spec` | The deployment spec: parsing, validation, translation to Orbit `Grants` and `Limits`. |
-| `occtl` | `occtl` | A thin blocking HTTP client; every command is one or two API calls. |
+| `occtl` | `occtl` | A thin blocking HTTP client; every command is one or two API calls. `occtl login` saves an API token. |
 
 The Orbit crates are pinned to one commit of `orin-lang/orbit` in the workspace `Cargo.toml`. The host ABI is versioned
 per capability (`orbit:kv/v1`, ...), so bumping the pin is a deliberate act.
+
+## Organisations, projects and the public gateway
+
+Apps live in projects, projects in organisations; a project name is also its hostname. The engine itself still sees one
+flat namespace of **app keys** (`hello` in the `default` project, `shop.web` elsewhere), which is what the Orbit tenant,
+the KV rows, the log lines and the files directory are keyed by. The gateway gives each project `<project>.<base>` and
+each verified custom domain the same routes, proxies to HTTP services on loopback ports, and holds the certificates.
+[platform.md](platform.md) is the full description.
 
 ## The three kinds of app
 
@@ -86,7 +97,11 @@ propagation or export yet (milestone 2).
 
 ## Storage schema
 
-`crates/oc-store/src/schema.sql`, version 1 (`meta.schema_version`). Times are Unix milliseconds in UTC.
+`crates/oc-store/src/schema.sql` is version 1 (`meta.schema_version`); `migrate_v2.sql` adds the platform tables and is
+applied on first start of a version-1 database (the existing apps move to the `default` project of the `default`
+organisation). Times are Unix milliseconds in UTC. The version-2 tables (`orgs`, `projects`, `users`, `memberships`,
+`sessions`, `api_tokens`, `audit_log`, `routes`, `domains`, `app_ports`, `certs`, `acme_accounts`) are listed in
+[platform.md](platform.md#schema-version-2-additions); `apps` gained `project_id` and `short`.
 
 | Table | Key | Content |
 |---|---|---|
@@ -132,11 +147,15 @@ including its files directory, so a new app of the same name starts empty.
 **Resource limits** bound every run: linear memory (`limits.memory_mb`, default 64), wall-clock time (60 s for jobs and
 consumers, none for services), and optional fuel when `--fuel-metering` is on. Payloads are capped (below).
 
-**Control plane.** `/v1` requires `Authorization: Bearer <ORBIT_CLOUD_TOKEN>` (compared in constant time); the
-Server-Sent-Events stream also accepts `?token=` because browsers cannot set headers on `EventSource`. `/healthz` and
-`/metrics` are open. Without a token the API is open and `orbitd` says so in the log; the container and the appliance
-require one. The token is a single admin credential: whoever has it can run any module with any grant the spec asks
-for, so treat it like root on the node. Put TLS in front of it.
+**Control plane.** `/v1` requires a principal: users sign in with a password (argon2id) and get an `HttpOnly`
+session cookie (stored hashed, CSRF-protected), automation uses scoped `oc_` API tokens (stored hashed, capped by their
+creator's role), and `ORBIT_CLOUD_TOKEN` remains as a break-glass admin credential (constant-time comparison). Every
+permission decision is a call on `Authz` with a resource and a permission; a project you have no role in answers 404.
+Control-plane changes are written to the audit log. `/healthz` and `/metrics` are open. A node without a token and
+without users is open and says so in the log. Whoever may deploy (developer or above) can run any module with any grant
+the spec asks for inside their project, including `connect` to arbitrary hosts and `listen` on ports: grant the role
+accordingly. Per-tenant network policy is not implemented. Put the direct `--listen` port behind the gateway or a
+firewall; the gateway terminates TLS.
 
 **Process hardening.** The systemd unit and the appliance run `orbitd` as an unprivileged user with no capabilities, a
 read-only file system except the data directory, a syscall filter and `NoNewPrivileges`. WebAssembly isolation is the
@@ -155,6 +174,6 @@ inner boundary; the sandbox is the outer one.
 | Log lines per request | 1 to 5000 (default 200) |
 | Names (apps, queues) | `[a-z0-9-]`, 1 to 63 characters, not starting with `-` |
 
-Not yet: retention (logs, runs, spans and dead letters grow until the app is deleted; milestone 2), multiple nodes,
-users and scopes, TLS, schedules, secrets, OpenTelemetry export. SQLite serialises all writers behind one connection;
+Not yet: retention (logs, runs, spans and dead letters grow until the app is deleted; milestone 2; proxied requests add
+one log line and one span each), multiple nodes, OIDC and passkeys, schedules, secrets, OpenTelemetry export, quotas. SQLite serialises all writers behind one connection;
 that is ample for one node, and a reason the cluster design (milestone 4) moves the control plane elsewhere.

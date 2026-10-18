@@ -58,9 +58,10 @@ only service of a minimal appliance OS image.
   runs started through the API.
 * Retention: per-app limits for log lines, runs and dead letters, applied by a background compactor.
 * Schedules: cron-style triggers for jobs.
-* HTTP ingress: one listener that routes `Host` / path prefixes to service apps (today a service listens on its own
-  granted port).
-* Users and API tokens with scopes instead of the single admin token; audit log of control-plane changes.
+* ~~HTTP ingress~~ done, see [platform.md](platform.md): the gateway routes `Host` / path prefixes to service apps,
+  gives projects `<project>.<base>`, verifies customers' domains and obtains certificates.
+* ~~Users and API tokens with scopes instead of the single admin token; audit log of control-plane changes~~ done
+  (organisations, projects, roles, sessions, tokens); OIDC and passkeys are the next step.
 * Backups: online SQLite backup to a file or object storage.
 
 ### M3: richer data services
@@ -101,5 +102,5 @@ has to keep.
 
 ## Non-goals for M1
 
-Multi-node operation, users and roles, TLS termination (put a reverse proxy in front), arbitrary containers (the unit of
+Multi-node operation, arbitrary containers (the unit of
 deployment is a WebAssembly module, by design).

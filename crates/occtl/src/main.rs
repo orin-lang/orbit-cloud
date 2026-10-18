@@ -61,6 +61,9 @@ enum Cmd {
         /// A persistent directory mounted at /data.
         #[arg(long)]
         files: bool,
+        /// A service that speaks HTTP: it gets a port in $PORT and the project's routes lead to it.
+        #[arg(long)]
+        http: bool,
         /// Memory limit in MiB.
         #[arg(long)]
         memory_mb: Option<u64>,
@@ -543,6 +546,7 @@ fn run() -> Result<()> {
             env,
             args,
             files,
+            http,
             memory_mb,
             timeout_ms,
         } => {
@@ -558,6 +562,9 @@ fn run() -> Result<()> {
                 .context("the spec must be a JSON object")?;
             if let Some(k) = kind {
                 o.insert("kind".into(), json!(k));
+            }
+            if http {
+                o.insert("http".into(), json!(true));
             }
             if let Some(q) = queue {
                 o.insert("queue".into(), json!(q));
