@@ -85,6 +85,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/apps/{app}/deployments/{id}/activate", post(activate))
         .route("/apps/{app}/runs", get(list_runs).post(start_run))
+        .route("/apps/{app}/database", get(database_status))
         .route("/apps/{app}/kv", get(kv_namespaces))
         .route("/apps/{app}/kv/{ns}", get(kv_list))
         .route(
@@ -187,15 +188,73 @@ async fn get_app(State(s): State<AppState>, Path(app): Path<String>) -> ApiResul
     ))
 }
 
-async fn delete_app(State(s): State<AppState>, Path(app): Path<String>) -> ApiResult<StatusCode> {
-    s.node.executor.store().delete_app(&app)?;
-    s.node.reconcile(&app).await?;
-    // after the worker has stopped, so nothing is writing there any more
-    s.node
-        .executor
-        .remove_app_files(&app)
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("app files: {e}")))?;
+#[derive(Deserialize, Default)]
+struct DeleteParams {
+    /// Also drop the app's PostgreSQL database and role (irreversible).
+    purge: Option<bool>,
+}
+
+async fn delete_app(
+    State(s): State<AppState>,
+    Path(app): Path<String>,
+    Query(p): Query<DeleteParams>,
+) -> ApiResult<StatusCode> {
+    let purge = p.purge.unwrap_or(false);
+    let store = s.node.executor.store();
+    let deleted = store.delete_app(&app);
+    if purge
+        && matches!(deleted, Err(StoreError::NotFound(_)))
+        && store.app_database(&app)?.is_some()
+    {
+        // only an orphaned database is left
+    } else {
+        deleted?;
+        s.node.reconcile(&app).await?;
+        // after the worker has stopped, so nothing is writing there any more
+        s.node
+            .executor
+            .remove_app_files(&app)
+            .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("app files: {e}")))?;
+    }
+    if purge && let Some(pg) = s.node.executor.postgres() {
+        pg.purge(store, &app).await?;
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, Default)]
+struct DatabaseParams {
+    /// Include the password (in `password` and in `url`).
+    password: Option<bool>,
+}
+
+/// `GET /v1/apps/{app}/database`: the app's PostgreSQL database.
+async fn database_status(
+    State(s): State<AppState>,
+    Path(app): Path<String>,
+    Query(p): Query<DatabaseParams>,
+) -> ApiResult<Json<Value>> {
+    let Some(pg) = s.node.executor.postgres() else {
+        return Err(ApiError::bad("this node has no --postgres-url"));
+    };
+    let store = s.node.executor.store();
+    let enabled = match store.app(&app) {
+        Ok(a) => match a.active_deployment {
+            Some(id) => store
+                .deployments(&app)?
+                .iter()
+                .find(|d| d.id == id)
+                .and_then(|d| d.spec.get("postgres").and_then(Value::as_bool))
+                .unwrap_or(false),
+            None => false,
+        },
+        Err(StoreError::NotFound(_)) if store.app_database(&app)?.is_some() => false,
+        Err(e) => return Err(e.into()),
+    };
+    Ok(Json(
+        pg.status(store, &app, p.password.unwrap_or(false), enabled)
+            .await?,
+    ))
 }
 
 async fn list_deployments(
@@ -235,6 +294,14 @@ async fn deploy(
         return Err(ApiError::bad(format!(
             "invalid app name `{app}`: 1-63 of a-z, 0-9 and -"
         )));
+    }
+    if spec.postgres {
+        let Some(pg) = s.node.executor.postgres() else {
+            return Err(ApiError::bad(
+                "the spec asks for postgres but this node has no --postgres-url",
+            ));
+        };
+        pg.ensure(s.node.executor.store(), &app).await?;
     }
     let store = s.node.executor.store();
     let sha = store.put_module(&body)?;
@@ -506,7 +573,7 @@ async fn kv_delete(
 // ------------------------------------------------------------------------------------------------ queues
 
 async fn list_queues(State(s): State<AppState>) -> ApiResult<Json<Value>> {
-    Ok(Json(json!(s.node.executor.store().queues()?)))
+    Ok(Json(json!(s.node.executor.queues().stats()?)))
 }
 
 async fn enqueue(
@@ -520,7 +587,7 @@ async fn enqueue(
             "message over 1 MiB".into(),
         ));
     }
-    let id = s.node.executor.store().enqueue(&q, &body)?;
+    let id = s.node.executor.queues().publish(&q, &body)?;
     s.node.queue_signal.notify_waiters();
     Ok((StatusCode::CREATED, Json(json!({ "id": id, "queue": q }))))
 }
@@ -546,7 +613,7 @@ async fn lease(
     match s
         .node
         .executor
-        .store()
+        .queues()
         .lease(&q, p.lease_ms.unwrap_or(30_000).clamp(1, 3_600_000))?
     {
         Some(m) => Ok(Json(message_json(&m)).into_response()),
@@ -567,7 +634,7 @@ async fn ack(
     Path((_q, id)): Path<(String, i64)>,
     Json(b): Json<AckBody>,
 ) -> ApiResult<StatusCode> {
-    s.node.executor.store().ack(id, &b.token)?;
+    s.node.executor.queues().ack(id, &b.token)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -576,7 +643,7 @@ async fn nack(
     Path((_q, id)): Path<(String, i64)>,
     Json(b): Json<AckBody>,
 ) -> ApiResult<Json<Value>> {
-    let o = s.node.executor.store().nack(
+    let o = s.node.executor.queues().nack(
         id,
         &b.token,
         b.error.as_deref().unwrap_or("rejected"),
@@ -594,7 +661,7 @@ async fn dead_letters(
     let dead = s
         .node
         .executor
-        .store()
+        .queues()
         .dead_letters(&q, l.limit.unwrap_or(100))?;
     Ok(Json(json!(
         dead.iter().map(message_json).collect::<Vec<_>>()
@@ -602,7 +669,7 @@ async fn dead_letters(
 }
 
 async fn redrive(State(s): State<AppState>, Path(q): Path<String>) -> ApiResult<Json<Value>> {
-    let n = s.node.executor.store().redrive(&q)?;
+    let n = s.node.executor.queues().redrive(&q)?;
     s.node.queue_signal.notify_waiters();
     Ok(Json(json!({ "redriven": n })))
 }

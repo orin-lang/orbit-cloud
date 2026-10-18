@@ -74,6 +74,21 @@ pub struct App {
     pub active_deployment: Option<i64>,
 }
 
+/// The PostgreSQL database and role provisioned for an app. Not `Serialize`: the password must not leak by accident.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AppDatabase {
+    /// The app (or, later, project-scoped app) it belongs to.
+    pub app: String,
+    /// Database name.
+    pub db_name: String,
+    /// Login role (owner of the database).
+    pub role: String,
+    /// The role's password (clear text; encryption at rest is a follow-up).
+    pub password: String,
+    /// Creation time.
+    pub created_at: i64,
+}
+
 /// One immutable version of an app.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Deployment {
@@ -489,6 +504,56 @@ impl Store {
         tx.execute("DELETE FROM kv WHERE tenant = ?1", params![name])?;
         tx.commit()?;
         Ok(())
+    }
+
+    // ------------------------------------------------------------------------------------------------ app databases
+
+    /// The PostgreSQL database provisioned for `app`, if any.
+    ///
+    /// # Errors
+    /// [`StoreError::Db`].
+    pub fn app_database(&self, app: &str) -> Result<Option<AppDatabase>> {
+        Ok(self
+            .db()
+            .query_row(
+                "SELECT app, db_name, role, password, created_at FROM app_databases WHERE app = ?1",
+                params![app],
+                |r| {
+                    Ok(AppDatabase {
+                        app: r.get(0)?,
+                        db_name: r.get(1)?,
+                        role: r.get(2)?,
+                        password: r.get(3)?,
+                        created_at: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Records (or replaces) the database of an app.
+    ///
+    /// # Errors
+    /// [`StoreError::Db`].
+    pub fn put_app_database(&self, d: &AppDatabase) -> Result<()> {
+        self.db().execute(
+            "INSERT INTO app_databases (app, db_name, role, password, created_at) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT (app) DO UPDATE SET db_name = excluded.db_name, role = excluded.role,
+               password = excluded.password",
+            params![d.app, d.db_name, d.role, d.password, d.created_at],
+        )?;
+        Ok(())
+    }
+
+    /// Forgets the database of an app; true if there was one.
+    ///
+    /// # Errors
+    /// [`StoreError::Db`].
+    pub fn delete_app_database(&self, app: &str) -> Result<bool> {
+        Ok(self
+            .db()
+            .execute("DELETE FROM app_databases WHERE app = ?1", params![app])?
+            > 0)
     }
 
     // ------------------------------------------------------------------------------------------------ modules
@@ -962,6 +1027,33 @@ impl Store {
         Ok(db.last_insert_rowid())
     }
 
+    /// Enqueues several messages in order in one transaction; returns the id of the first.
+    ///
+    /// # Errors
+    /// [`StoreError::Conflict`] for a bad queue name or an empty batch.
+    pub fn enqueue_batch(&self, queue: &str, bodies: &[Vec<u8>]) -> Result<i64> {
+        if !valid_name(queue) || bodies.is_empty() {
+            return Err(StoreError::Conflict(format!(
+                "invalid queue name `{queue}` or empty batch"
+            )));
+        }
+        let now = now_ms();
+        let mut db = self.db();
+        let tx = db.transaction()?;
+        let mut first = 0;
+        for (i, body) in bodies.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO queue_messages (queue, body, state, visible_at, enqueued_at) VALUES (?1, ?2, 'ready', ?3, ?3)",
+                params![queue, body, now],
+            )?;
+            if i == 0 {
+                first = tx.last_insert_rowid();
+            }
+        }
+        tx.commit()?;
+        Ok(first)
+    }
+
     /// Leases the oldest deliverable message of `queue` for `lease_ms`, or `None` when there is none.
     ///
     /// # Errors
@@ -1282,6 +1374,31 @@ mod tests {
             s.kv_get("b", "ns", b"k1").unwrap().as_deref(),
             Some(&b"other tenant"[..])
         );
+    }
+
+    #[test]
+    fn app_database_roundtrip() {
+        let s = Store::open_in_memory().unwrap();
+        assert_eq!(s.app_database("a").unwrap(), None);
+        let d = AppDatabase {
+            app: "a".into(),
+            db_name: "oc_a".into(),
+            role: "oc_a".into(),
+            password: "pw".into(),
+            created_at: 1,
+        };
+        s.put_app_database(&d).unwrap();
+        assert_eq!(s.app_database("a").unwrap(), Some(d.clone()));
+        let d2 = AppDatabase {
+            password: "pw2".into(),
+            created_at: 2,
+            ..d
+        };
+        s.put_app_database(&d2).unwrap();
+        let got = s.app_database("a").unwrap().unwrap();
+        assert_eq!((got.password.as_str(), got.created_at), ("pw2", 1));
+        assert!(s.delete_app_database("a").unwrap());
+        assert!(!s.delete_app_database("a").unwrap());
     }
 
     #[test]

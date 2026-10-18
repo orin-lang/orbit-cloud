@@ -9,4 +9,10 @@ if [ ! -s "$tok" ]; then
 fi
 ORBIT_CLOUD_TOKEN=$(cat "$tok")
 export ORBIT_CLOUD_TOKEN
+# Optional: the PostgreSQL admin URL (credential orbit-cloud.postgres-url) enables `"postgres": true` in app specs.
+pg="${CREDENTIALS_DIRECTORY:-/nonexistent}/orbit-cloud.postgres-url"
+if [ -s "$pg" ]; then
+    ORBIT_CLOUD_POSTGRES_URL=$(cat "$pg")
+    export ORBIT_CLOUD_POSTGRES_URL
+fi
 exec /usr/bin/orbitd "$@"

@@ -11,13 +11,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use oc_store::{Deployment, NewLog, Run, RunOutcome, Span, Store, random_id};
 use orbit_caps::{
     ClockCapability, FsCapability, KvCapability, KvError, KvStore, LogCapability, LogRecord,
-    LogSink, NetCapability, ProcessCapability, RandomCapability, StdinError, StdinProvider,
-    StdinReader, WasiCapability,
+    LogSink, NetCapability, ProcessCapability, QueueCapability, RandomCapability, StdinError,
+    StdinProvider, StdinReader, WasiCapability,
 };
 use orbit_runtime::{CapabilityRegistry, ExecError, InstanceInfo, Isolate, Runtime, RuntimeConfig};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::spec::Spec;
+use crate::provision::Postgres;
+use crate::queues::{GuestQueues, MessageQueue};
+use crate::spec::{Injected, Spec};
 
 /// Key in the `process/v1` grant config that names the stdin bytes of a run (ignored by Orbit, read by [`RunStdin`]).
 pub const STDIN_KEY: &str = "orbit_cloud_stdin";
@@ -195,6 +197,9 @@ pub struct Executor {
     runs: Arc<RunIndex>,
     stdin: RunStdin,
     files_root: PathBuf,
+    queues: Arc<dyn MessageQueue>,
+    postgres: Option<Arc<Postgres>>,
+    queue_signal: Arc<tokio::sync::Notify>,
     log_tx: mpsc::UnboundedSender<LogMsg>,
     /// Metrics.
     pub counters: Arc<Counters>,
@@ -252,6 +257,21 @@ impl Executor {
         data_dir: &std::path::Path,
         fuel_metering: bool,
     ) -> anyhow::Result<Self> {
+        let queues: Arc<dyn MessageQueue> = Arc::clone(&store) as Arc<dyn MessageQueue>;
+        Self::with_queues(store, data_dir, fuel_metering, queues)
+    }
+
+    /// Like [`new`](Self::new) with another queue backend (the default is the store itself).
+    ///
+    /// # Errors
+    /// When the Orbit engine cannot be created.
+    pub fn with_queues(
+        store: Arc<Store>,
+        data_dir: &std::path::Path,
+        fuel_metering: bool,
+        queues: Arc<dyn MessageQueue>,
+    ) -> anyhow::Result<Self> {
+        let queue_signal = Arc::new(tokio::sync::Notify::new());
         let counters = Arc::new(Counters::default());
         let runs = Arc::new(RunIndex::default());
         let (tx, rx) = mpsc::unbounded_channel();
@@ -270,6 +290,10 @@ impl Executor {
             .with(RandomCapability::new())
             .with(NetCapability::new())
             .with(KvCapability::new(StoreKv(Arc::clone(&store))))
+            .with(QueueCapability::new(GuestQueues::new(
+                Arc::clone(&queues),
+                Arc::clone(&queue_signal),
+            )))
             .with(wasi)
             .with(FsCapability::new())
             .with(ProcessCapability::new().with_stdin(stdin.clone()));
@@ -283,9 +307,57 @@ impl Executor {
             runs,
             stdin,
             files_root,
+            queues,
+            postgres: None,
+            queue_signal,
             log_tx: tx,
             counters,
         })
+    }
+
+    /// Enables PostgreSQL provisioning (`--postgres-url`).
+    #[must_use]
+    pub fn with_postgres(mut self, postgres: Arc<Postgres>) -> Self {
+        self.postgres = Some(postgres);
+        self
+    }
+
+    /// The operator's PostgreSQL server, when configured.
+    #[must_use]
+    pub fn postgres(&self) -> Option<&Arc<Postgres>> {
+        self.postgres.as_ref()
+    }
+
+    /// What to add to a run of `app`: its `DATABASE_URL` and the grant to reach the server.
+    fn injection(&self, app: &str, spec: &Spec) -> Result<Injected, String> {
+        let mut inj = Injected::default();
+        if !spec.postgres {
+            return Ok(inj);
+        }
+        let Some(pg) = &self.postgres else {
+            return Err("the spec asks for postgres but this node has no --postgres-url".into());
+        };
+        let d = self
+            .store
+            .app_database(app)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("the database of `{app}` is not provisioned"))?;
+        inj.env
+            .insert("DATABASE_URL".to_owned(), pg.database_url(&d, true));
+        inj.connect.push(pg.connect_pattern());
+        Ok(inj)
+    }
+
+    /// The queue backend (consumers, the queue API and `orbit:queue/v1` all go through it).
+    #[must_use]
+    pub fn queues(&self) -> &Arc<dyn MessageQueue> {
+        &self.queues
+    }
+
+    /// Woken after every publish so idle consumers poll at once.
+    #[must_use]
+    pub fn queue_signal(&self) -> &Arc<tokio::sync::Notify> {
+        &self.queue_signal
     }
 
     /// The store.
@@ -424,7 +496,16 @@ impl Executor {
                 .insert(key.clone(), bytes);
             key
         });
-        let grants = match spec.grants(&d.app, stdin_key.as_deref(), files_dir.as_deref()) {
+        let injected = match self.injection(&d.app, &spec) {
+            Ok(i) => i,
+            Err(e) => return failed(e),
+        };
+        let grants = match spec.grants_with(
+            &d.app,
+            stdin_key.as_deref(),
+            files_dir.as_deref(),
+            &injected,
+        ) {
             Ok(g) => g,
             Err(e) => return failed(e),
         };

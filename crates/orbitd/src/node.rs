@@ -40,10 +40,11 @@ impl Node {
     /// A node around `executor`.
     #[must_use]
     pub fn new(executor: Arc<Executor>) -> Arc<Self> {
+        let queue_signal = Arc::clone(executor.queue_signal());
         Arc::new(Self {
             executor,
             workers: tokio::sync::Mutex::new(HashMap::new()),
-            queue_signal: Arc::new(Notify::new()),
+            queue_signal,
         })
     }
 
@@ -250,7 +251,7 @@ impl Node {
             if *stop.borrow() {
                 return;
             }
-            let msg = match self.store().lease(&queue, lease_ms) {
+            let msg = match self.executor.queues().lease(&queue, lease_ms) {
                 Ok(m) => m,
                 Err(e) => {
                     tracing::error!("consumer `{}`: lease failed: {e}", d.app);
@@ -273,7 +274,7 @@ impl Node {
             };
             let Some(run) = self.run_until_stopped(&d, req, &mut stop).await else {
                 // Stopped mid-run: give the message back at once.
-                let _ = self.store().nack(
+                let _ = self.executor.queues().nack(
                     msg.id,
                     &msg.lease_token,
                     "consumer stopped",
@@ -283,14 +284,18 @@ impl Node {
                 return;
             };
             let res = if run.status == "succeeded" {
-                self.store().ack(msg.id, &msg.lease_token).map(|()| None)
+                self.executor
+                    .queues()
+                    .ack(msg.id, &msg.lease_token)
+                    .map(|()| None)
             } else {
                 let err = run.error.clone().unwrap_or_else(|| "failed".into());
                 let delay = i64::try_from(
                     backoff(u32::try_from(msg.attempts).unwrap_or(u32::MAX)).as_millis(),
                 )
                 .unwrap_or(0);
-                self.store()
+                self.executor
+                    .queues()
                     .nack(msg.id, &msg.lease_token, &err, delay, max_attempts)
                     .map(Some)
             };

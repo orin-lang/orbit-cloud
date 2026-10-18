@@ -21,6 +21,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 futures-util.workspace = true
 tokio-stream.workspace = true
+tokio-postgres.workspace = true
+rand.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 wat.workspace = true

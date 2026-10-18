@@ -35,6 +35,26 @@ jobs:
       - name: test
         run: cargo test --workspace --locked
 
+  postgres:
+    name: provisioning against PostgreSQL 17
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: secret
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: provisioning tests
+        env:
+          ORBIT_CLOUD_TEST_POSTGRES_URL: postgres://postgres:secret@127.0.0.1:5432/postgres
+        run: cargo test -p orbitd --test postgres --locked -- --nocapture
+
   release:
     name: release build
     runs-on: ubuntu-latest
